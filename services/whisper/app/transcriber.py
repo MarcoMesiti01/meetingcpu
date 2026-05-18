@@ -1,6 +1,10 @@
-from faster_whisper import WhisperModel
+from pathlib import Path
 
 from app.model_catalog import get_model_option
+
+
+class AudioUnreadableError(Exception):
+    pass
 
 
 class LocalTranscriber:
@@ -13,6 +17,8 @@ class LocalTranscriber:
         option = get_model_option(model_id)
         if option is None:
             raise ValueError(f"Unknown model: {model_id}")
+        if not Path(audio_path).is_file():
+            raise AudioUnreadableError(f"Audio file does not exist: {audio_path}")
 
         model = self._load_model(model_id, option["compute_type"])
         segments, info = model.transcribe(
@@ -34,6 +40,8 @@ class LocalTranscriber:
         }
 
     def _load_model(self, model_id, compute_type):
+        from faster_whisper import WhisperModel
+
         if model_id not in self._models:
             self._models[model_id] = WhisperModel(
                 model_id,

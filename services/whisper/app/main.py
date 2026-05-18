@@ -4,7 +4,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.model_catalog import get_model_option
-from app.transcriber import LocalTranscriber
 
 
 class TranscribeRequest(BaseModel):
@@ -13,9 +12,21 @@ class TranscribeRequest(BaseModel):
     language: Optional[str] = None
 
 
+def create_default_transcriber():
+    from app.transcriber import LocalTranscriber
+
+    return LocalTranscriber()
+
+
+def is_audio_unreadable_error(error):
+    from app.transcriber import AudioUnreadableError
+
+    return isinstance(error, AudioUnreadableError)
+
+
 def create_app(transcriber=None):
     app = FastAPI(title="meetingcpu whisper service")
-    active_transcriber = transcriber or LocalTranscriber()
+    active_transcriber = transcriber or create_default_transcriber()
 
     @app.get("/health")
     def health():
@@ -55,6 +66,16 @@ def create_app(transcriber=None):
                     "suggestedModelIds": ["small", "base", "tiny"],
                 },
             ) from error
+        except Exception as error:
+            if is_audio_unreadable_error(error):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "code": "AUDIO_UNREADABLE",
+                        "message": str(error),
+                    },
+                ) from error
+            raise
 
     return app
 
