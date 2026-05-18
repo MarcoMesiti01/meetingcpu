@@ -1,7 +1,7 @@
 import type { ModelId } from "./models.js";
 import type { TranscriptResult } from "./sessions.js";
 
-type FetchLike = typeof fetch;
+export type FetchLike = typeof fetch;
 
 export interface TranscriptionRequest {
   audioPath: string;
