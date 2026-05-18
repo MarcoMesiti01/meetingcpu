@@ -18,6 +18,15 @@ describe("model catalog", () => {
     expect(getModelOption("large-v3-turbo")?.warning).toContain("experimental");
   });
 
+  it("returns copies so callers cannot mutate catalog entries", () => {
+    const option = getModelOption("small");
+    if (option) {
+      option.recommended = false;
+    }
+
+    expect(getModelOption("small")?.recommended).toBe(true);
+  });
+
   it("rejects unknown model ids with fallback suggestions", () => {
     const result = parseModelId("not-a-model");
     expect(result.ok).toBe(false);

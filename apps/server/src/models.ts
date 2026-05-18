@@ -79,7 +79,8 @@ export function listModelOptions(): ModelOption[] {
 }
 
 export function getModelOption(modelId: string): ModelOption | undefined {
-  return MODEL_OPTIONS.find((model) => model.id === modelId);
+  const option = MODEL_OPTIONS.find((model) => model.id === modelId);
+  return option ? { ...option } : undefined;
 }
 
 export function parseModelId(modelId: string | undefined): ModelParseResult {
