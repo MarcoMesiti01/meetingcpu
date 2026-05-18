@@ -12,6 +12,21 @@ describe("transcription client", () => {
     await expect(client.health()).resolves.toEqual({ ok: true, service: "meetingcpu-whisper" });
   });
 
+  it("turns failed health responses into structured local errors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({ detail: { code: "SERVICE_UNHEALTHY", message: "Service is warming up." } })
+    });
+
+    const client = createTranscriptionClient("http://127.0.0.1:8765", fetchMock);
+    await expect(client.health()).rejects.toMatchObject({
+      code: "SERVICE_UNHEALTHY",
+      status: 503,
+      message: "Service is warming up."
+    });
+  });
+
   it("posts a transcription request and returns transcript data", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -56,6 +71,17 @@ describe("transcription client", () => {
     await expect(client.transcribe({ audioPath: "a.webm", modelId: "small", language: null })).rejects.toMatchObject({
       code: "MODEL_UNAVAILABLE",
       status: 503
+    });
+  });
+
+  it("turns rejected transcription fetches into structured unreachable errors", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:8765"));
+
+    const client = createTranscriptionClient("http://127.0.0.1:8765", fetchMock);
+    await expect(client.transcribe({ audioPath: "a.webm", modelId: "small", language: null })).rejects.toMatchObject({
+      code: "TRANSCRIPTION_SERVICE_UNREACHABLE",
+      status: 0,
+      message: "Transcription service is unreachable: connect ECONNREFUSED 127.0.0.1:8765"
     });
   });
 });
