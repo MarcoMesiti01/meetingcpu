@@ -15,7 +15,26 @@ describe("session storage", () => {
 
     expect(session.id).toBe("2026-05-18-1330-design-sync-cpu");
     expect(session.path).toBe(join(root, "sessions", "2026-05-18-1330-design-sync-cpu"));
-    await expect(stat(session.path)).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    expect((await stat(session.path)).isDirectory()).toBe(true);
+  });
+
+  it("creates a unique folder when session slugs collide", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const first = await createSession({
+      dataRoot: root,
+      now: new Date("2026-05-18T13:30:00.000Z"),
+      title: "Local Meeting"
+    });
+    const second = await createSession({
+      dataRoot: root,
+      now: new Date("2026-05-18T13:30:00.000Z"),
+      title: "Local Meeting"
+    });
+
+    expect(first.id).toBe("2026-05-18-1330-local-meeting");
+    expect(second.id).toBe("2026-05-18-1330-local-meeting-2");
+    expect((await stat(first.path)).isDirectory()).toBe(true);
+    expect((await stat(second.path)).isDirectory()).toBe(true);
   });
 
   it("saves the original recording and metadata", async () => {
@@ -66,6 +85,44 @@ describe("session storage", () => {
     await expect(readFile(join(session.path, "transcript.txt"), "utf8")).resolves.toBe("  Hello world.  \n");
     const json = JSON.parse(await readFile(join(session.path, "transcript.json"), "utf8"));
     expect(json.segments[0]).toEqual({ start: 0, end: 3.2, text: "Hello world." });
+  });
+
+  it("preserves recording metadata when saving transcript metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const session = await createSession({
+      dataRoot: root,
+      now: new Date("2026-05-18T13:30:00.000Z"),
+      title: "Metadata"
+    });
+    const saved = await saveRecording({
+      session,
+      originalName: "meeting.webm",
+      buffer: Buffer.from("audio-bytes"),
+      sourceType: "microphone",
+      modelId: "small"
+    });
+
+    await saveTranscript({
+      session,
+      transcript: {
+        text: "Hello world.",
+        language: "en",
+        durationSeconds: 3.2,
+        segments: [{ start: 0, end: 3.2, text: "Hello world." }]
+      },
+      modelId: "small"
+    });
+
+    const metadata = JSON.parse(await readFile(join(session.path, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      sessionId: session.id,
+      sourceType: "microphone",
+      recordingPath: saved.recordingPath,
+      status: "transcribed",
+      language: "en",
+      durationSeconds: 3.2,
+      modelId: "small"
+    });
   });
 
   it("normalizes empty titles to local meeting", () => {
