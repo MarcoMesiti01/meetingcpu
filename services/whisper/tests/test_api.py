@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
+from app.errors import AudioUnreadableError
 from app.main import create_app
-from app.transcriber import AudioUnreadableError
 
 
 class FakeTranscriber:
@@ -22,23 +22,25 @@ class FailingTranscriber:
         raise self.error
 
 
-def test_importing_main_does_not_require_faster_whisper(monkeypatch):
+def test_importing_main_does_not_require_transcriber_or_faster_whisper(monkeypatch):
     import builtins
     import importlib
     import sys
 
     original_import = builtins.__import__
 
-    def reject_faster_whisper(name, *args, **kwargs):
-        if name == "faster_whisper":
-            raise AssertionError("faster_whisper imported eagerly")
+    def reject_heavy_imports(name, *args, **kwargs):
+        if name in {"app.transcriber", "faster_whisper"}:
+            raise AssertionError(f"{name} imported eagerly")
         return original_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", reject_faster_whisper)
+    monkeypatch.setattr(builtins, "__import__", reject_heavy_imports)
     sys.modules.pop("app.main", None)
+    sys.modules.pop("app.transcriber", None)
     main = importlib.import_module("app.main")
 
     assert main.create_app is not None
+    assert "app.transcriber" not in sys.modules
     assert "faster_whisper" not in sys.modules
 
 

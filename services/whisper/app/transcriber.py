@@ -1,10 +1,7 @@
 from pathlib import Path
 
+from app.errors import AudioUnreadableError
 from app.model_catalog import get_model_option
-
-
-class AudioUnreadableError(Exception):
-    pass
 
 
 class LocalTranscriber:
@@ -21,12 +18,19 @@ class LocalTranscriber:
             raise AudioUnreadableError(f"Audio file does not exist: {audio_path}")
 
         model = self._load_model(model_id, option["compute_type"])
-        segments, info = model.transcribe(
-            audio_path,
-            language=language,
-            vad_filter=True,
-            beam_size=5,
-        )
+        try:
+            segments, info = model.transcribe(
+                audio_path,
+                language=language,
+                vad_filter=True,
+                beam_size=5,
+            )
+        except (MemoryError, RuntimeError):
+            raise
+        except Exception as error:
+            raise AudioUnreadableError(
+                f"Audio file could not be decoded: {audio_path}. {error}"
+            ) from error
         segment_list = [
             {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
             for segment in segments

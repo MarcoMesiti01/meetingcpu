@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from app.errors import AudioUnreadableError
 from app.model_catalog import get_model_option
 
 
@@ -18,15 +19,15 @@ def create_default_transcriber():
     return LocalTranscriber()
 
 
-def is_audio_unreadable_error(error):
-    from app.transcriber import AudioUnreadableError
-
-    return isinstance(error, AudioUnreadableError)
-
-
 def create_app(transcriber=None):
     app = FastAPI(title="meetingcpu whisper service")
-    active_transcriber = transcriber or create_default_transcriber()
+    active_transcriber = transcriber
+
+    def get_active_transcriber():
+        nonlocal active_transcriber
+        if active_transcriber is None:
+            active_transcriber = create_default_transcriber()
+        return active_transcriber
 
     @app.get("/health")
     def health():
@@ -45,7 +46,7 @@ def create_app(transcriber=None):
             )
 
         try:
-            return active_transcriber.transcribe(
+            return get_active_transcriber().transcribe(
                 request.audioPath, request.modelId, request.language
             )
         except RuntimeError as error:
@@ -66,16 +67,14 @@ def create_app(transcriber=None):
                     "suggestedModelIds": ["small", "base", "tiny"],
                 },
             ) from error
-        except Exception as error:
-            if is_audio_unreadable_error(error):
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "code": "AUDIO_UNREADABLE",
-                        "message": str(error),
-                    },
-                ) from error
-            raise
+        except AudioUnreadableError as error:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "AUDIO_UNREADABLE",
+                    "message": str(error),
+                },
+            ) from error
 
     return app
 
