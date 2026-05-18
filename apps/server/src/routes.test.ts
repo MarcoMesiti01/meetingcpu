@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import request from "supertest";
@@ -55,9 +55,11 @@ describe("server routes", () => {
   });
 
   it("rejects unknown model ids before saving work", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcriptionClient = fakeTranscriptionClient();
     const app = createApp({
-      dataRoot: await mkdtemp(join(tmpdir(), "meetingcpu-")),
-      transcriptionClient: fakeTranscriptionClient()
+      dataRoot,
+      transcriptionClient
     });
 
     const response = await request(app)
@@ -69,6 +71,8 @@ describe("server routes", () => {
 
     expect(response.body.code).toBe("UNKNOWN_MODEL");
     expect(response.body.suggestedModelIds).toEqual(["small", "base", "tiny"]);
+    expect(transcriptionClient.transcribe).not.toHaveBeenCalled();
+    await expect(access(join(dataRoot, "sessions"))).rejects.toThrow();
   });
 });
 
