@@ -67,7 +67,7 @@ export async function saveTranscript(input: {
   modelId: ModelId;
 }): Promise<void> {
   await writeFile(join(input.session.path, "transcript.json"), JSON.stringify(input.transcript, null, 2));
-  await writeFile(join(input.session.path, "transcript.txt"), `${input.transcript.text.trim()}\n`);
+  await writeFile(join(input.session.path, "transcript.txt"), `${input.transcript.text}\n`);
   await writeMetadata(input.session, {
     sessionId: input.session.id,
     modelId: input.modelId,

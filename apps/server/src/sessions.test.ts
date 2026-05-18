@@ -55,7 +55,7 @@ describe("session storage", () => {
     await saveTranscript({
       session,
       transcript: {
-        text: "Hello world.",
+        text: "  Hello world.  ",
         language: "en",
         durationSeconds: 3.2,
         segments: [{ start: 0, end: 3.2, text: "Hello world." }]
@@ -63,7 +63,7 @@ describe("session storage", () => {
       modelId: "small"
     });
 
-    await expect(readFile(join(session.path, "transcript.txt"), "utf8")).resolves.toBe("Hello world.\n");
+    await expect(readFile(join(session.path, "transcript.txt"), "utf8")).resolves.toBe("  Hello world.  \n");
     const json = JSON.parse(await readFile(join(session.path, "transcript.json"), "utf8"));
     expect(json.segments[0]).toEqual({ start: 0, end: 3.2, text: "Hello world." });
   });
