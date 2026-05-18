@@ -74,6 +74,34 @@ describe("server routes", () => {
     expect(transcriptionClient.transcribe).not.toHaveBeenCalled();
     await expect(access(join(dataRoot, "sessions"))).rejects.toThrow();
   });
+
+  it("returns a controlled error when transcription fails after saving the recording", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockRejectedValue({
+      code: "MODEL_UNAVAILABLE",
+      status: 503,
+      message: "Model is not available locally."
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "microphone")
+      .field("modelId", "small")
+      .field("title", "Transcription failure")
+      .attach("audio", Buffer.from("audio"), "recording.webm")
+      .expect(503);
+
+    expect(response.body.code).toBe("MODEL_UNAVAILABLE");
+    const sessionId = response.body.sessionId;
+    const sessionPath = join(dataRoot, "sessions", sessionId);
+    await expect(readFile(join(sessionPath, "recording.webm"), "utf8")).resolves.toBe("audio");
+    await expect(access(join(sessionPath, "transcript.txt"))).rejects.toThrow();
+    await expect(access(join(sessionPath, "transcript.json"))).rejects.toThrow();
+  });
 });
 
 function fakeTranscriptionClient() {
