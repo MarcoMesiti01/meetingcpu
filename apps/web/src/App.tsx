@@ -1,4 +1,4 @@
-import { type ChangeEvent, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { type ModelOption, type createApiClient } from "./api/client";
 
 type Status = "loading" | "ready" | "recording" | "transcribing" | "complete" | "error";
@@ -30,47 +30,64 @@ export default function App({ api, recorder }: AppProps) {
   const [modelId, setModelId] = useState("");
   const [title, setTitle] = useState("Untitled meeting");
   const [error, setError] = useState("");
+  const [modelLoadError, setModelLoadError] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [sessionPath, setSessionPath] = useState("");
 
+  const loadModels = useCallback(async (isActive: () => boolean = () => true) => {
+    setError("");
+    setModelLoadError(false);
+    setStatus("loading");
+
+    try {
+      const response = await api.getModels();
+      if (!isActive()) return;
+
+      const nextModels = response.models ?? [];
+      if (nextModels.length === 0) {
+        setModels([]);
+        setModelId("");
+        setError("No local transcription models were found. Check that the server can see your model files, then reload models.");
+        setModelLoadError(true);
+        setStatus("error");
+        return;
+      }
+
+      setModels(nextModels);
+      setModelId(response.defaultModelId || nextModels[0].id);
+      setStatus("ready");
+    } catch (loadError) {
+      if (!isActive()) return;
+      setError(getErrorMessage(loadError, "Could not load model options. Check the local server, then reload models."));
+      setModelLoadError(true);
+      setStatus("error");
+    }
+  }, [api]);
+
   useEffect(() => {
     let isActive = true;
-
-    async function loadModels() {
-      try {
-        const response = await api.getModels();
-        if (!isActive) return;
-
-        setModels(response.models);
-        setModelId(response.defaultModelId || response.models[0]?.id || "");
-        setStatus("ready");
-      } catch (loadError) {
-        if (!isActive) return;
-        setError(getErrorMessage(loadError, "Could not load model options."));
-        setStatus("error");
-      }
-    }
-
-    loadModels();
+    loadModels(() => isActive);
 
     return () => {
       isActive = false;
     };
-  }, [api]);
+  }, [loadModels]);
 
   const selectedModel = useMemo(
     () => models.find((model) => model.id === modelId),
     [modelId, models]
   );
-  const canStartRecording = status === "ready" || status === "complete" || status === "error";
-  const canUpload = Boolean(modelId) && status !== "loading" && status !== "recording" && status !== "transcribing";
+  const canStartRecording = Boolean(modelId) && !modelLoadError && (status === "ready" || status === "complete" || status === "error");
+  const canUpload = Boolean(modelId) && !modelLoadError && status !== "loading" && status !== "recording" && status !== "transcribing";
 
   async function handleStartRecording() {
-    clearResult();
+    setError("");
+    setModelLoadError(false);
     setStatus("recording");
 
     try {
       await recorder.start();
+      clearResult();
     } catch (startError) {
       setError(getErrorMessage(startError, "Could not start recording."));
       setStatus("error");
@@ -134,7 +151,7 @@ export default function App({ api, recorder }: AppProps) {
             <p className="eyebrow">Local transcription</p>
             <h1 id="app-title">Local Meeting Transcription</h1>
           </div>
-          <span className={`status-pill status-${status}`}>{formatStatus(status)}</span>
+          <span className={`status-pill status-${status}`} role="status" aria-live="polite">{formatStatus(status)}</span>
         </header>
 
         <div className="control-grid">
@@ -169,13 +186,18 @@ export default function App({ api, recorder }: AppProps) {
           <p className="model-warning" role="note">{selectedModel.warning}</p>
         ) : null}
 
-        <div className="action-row" aria-label="Recording controls">
-          <button type="button" className="primary-action" onClick={handleStartRecording} disabled={!canStartRecording || !modelId}>
+        <div className="action-row" role="group" aria-label="Recording controls">
+          <button type="button" className="primary-action" onClick={handleStartRecording} disabled={!canStartRecording}>
             Start recording
           </button>
           <button type="button" className="secondary-action" onClick={handleStopAndTranscribe} disabled={status !== "recording"}>
             Stop and transcribe
           </button>
+          {modelLoadError ? (
+            <button type="button" className="secondary-action" onClick={() => void loadModels()} disabled={status === "loading"}>
+              Reload models
+            </button>
+          ) : null}
         </div>
 
         <div className="upload-panel">
