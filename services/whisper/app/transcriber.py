@@ -31,10 +31,21 @@ class LocalTranscriber:
             raise AudioUnreadableError(
                 f"Audio file could not be decoded: {audio_path}. {error}"
             ) from error
-        segment_list = [
-            {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
-            for segment in segments
-        ]
+        try:
+            segment_list = [
+                {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text.strip(),
+                }
+                for segment in segments
+            ]
+        except (MemoryError, RuntimeError):
+            raise
+        except Exception as error:
+            raise AudioUnreadableError(
+                f"Audio file could not be decoded: {audio_path}. {error}"
+            ) from error
         text = " ".join(segment["text"] for segment in segment_list).strip()
         return {
             "text": text,
