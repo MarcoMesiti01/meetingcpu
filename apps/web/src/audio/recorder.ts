@@ -4,6 +4,7 @@ export class BrowserAudioRecorder {
   private mediaRecorder: MediaRecorder | null = null;
   private chunks: Blob[] = [];
   private stream: MediaStream | null = null;
+  private startInProgress = false;
 
   constructor(
     private readonly getUserMedia: GetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
@@ -11,15 +12,17 @@ export class BrowserAudioRecorder {
   ) {}
 
   async start(): Promise<void> {
-    if (this.mediaRecorder) {
+    if (this.startInProgress || this.mediaRecorder) {
       throw new Error("Recording is already in progress.");
     }
 
-    const stream = await this.getUserMedia({ audio: true });
-    this.stream = stream;
-    this.chunks = [];
+    this.startInProgress = true;
 
     try {
+      const stream = await this.getUserMedia({ audio: true });
+      this.stream = stream;
+      this.chunks = [];
+
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
       mediaRecorder.ondataavailable = (event) => {
@@ -33,6 +36,8 @@ export class BrowserAudioRecorder {
     } catch (error) {
       this.reset();
       throw error;
+    } finally {
+      this.startInProgress = false;
     }
   }
 

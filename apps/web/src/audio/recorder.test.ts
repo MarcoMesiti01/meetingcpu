@@ -32,29 +32,80 @@ describe("BrowserAudioRecorder", () => {
     expect(getUserMedia).toHaveBeenCalledTimes(1);
   });
 
+  it("guards overlapping starts while microphone access is pending", async () => {
+    const stream = createStream();
+    const pendingMicrophone = createDeferred<MediaStream>();
+    const getUserMedia = vi.fn().mockReturnValue(pendingMicrophone.promise);
+    const recorder = new BrowserAudioRecorder(getUserMedia, createFakeMediaRecorder());
+
+    const firstStart = recorder.start();
+
+    await expect(recorder.start()).rejects.toThrow("Recording is already in progress.");
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+
+    pendingMicrophone.resolve(stream);
+    await firstStart;
+    await recorder.stop();
+  });
+
+  it("clears the start guard when microphone access fails", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn()
+      .mockRejectedValueOnce(new Error("microphone denied"))
+      .mockResolvedValueOnce(stream);
+    const recorder = new BrowserAudioRecorder(getUserMedia, createFakeMediaRecorder());
+
+    await expect(recorder.start()).rejects.toThrow("microphone denied");
+
+    await recorder.start();
+    await recorder.stop();
+
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+  });
+
   it("cleans up tracks when recorder construction fails", async () => {
     const stream = createStream();
-    const getUserMedia = vi.fn().mockResolvedValue(stream);
-    const RecorderCtor = vi.fn(() => {
-      throw new Error("unsupported recorder");
-    }) as unknown as typeof MediaRecorder;
+    const retryStream = createStream();
+    const getUserMedia = vi.fn()
+      .mockResolvedValueOnce(stream)
+      .mockResolvedValueOnce(retryStream);
+    const FakeMediaRecorder = createFakeMediaRecorder();
+    const RecorderCtor = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("unsupported recorder");
+      })
+      .mockImplementation((nextStream: MediaStream) => new FakeMediaRecorder(nextStream)) as unknown as typeof MediaRecorder;
     const recorder = new BrowserAudioRecorder(getUserMedia, RecorderCtor);
 
     await expect(recorder.start()).rejects.toThrow("unsupported recorder");
 
     expect(stream.stop).toHaveBeenCalledTimes(1);
     await expect(recorder.stop()).rejects.toThrow("Recording has not started.");
+
+    await recorder.start();
+    await recorder.stop();
+    expect(retryStream.stop).toHaveBeenCalledTimes(1);
   });
 
   it("cleans up tracks when recorder start fails", async () => {
     const stream = createStream();
-    const getUserMedia = vi.fn().mockResolvedValue(stream);
-    const recorder = new BrowserAudioRecorder(getUserMedia, createFakeMediaRecorder({ startError: new Error("start failed") }));
+    const retryStream = createStream();
+    const getUserMedia = vi.fn()
+      .mockResolvedValueOnce(stream)
+      .mockResolvedValueOnce(retryStream);
+    const recorder = new BrowserAudioRecorder(
+      getUserMedia,
+      createFakeMediaRecorder({ startErrorOnce: new Error("start failed") })
+    );
 
     await expect(recorder.start()).rejects.toThrow("start failed");
 
     expect(stream.stop).toHaveBeenCalledTimes(1);
     await expect(recorder.stop()).rejects.toThrow("Recording has not started.");
+
+    await recorder.start();
+    await recorder.stop();
+    expect(retryStream.stop).toHaveBeenCalledTimes(1);
   });
 
   it("cleans up state after stop so stop is not repeatable and recording can restart", async () => {
@@ -102,18 +153,30 @@ function createStream() {
   } as unknown as MediaStream & { stop: ReturnType<typeof vi.fn> };
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+
+  return { promise, resolve };
+}
+
 function createFakeMediaRecorder(options: {
   emitDataOnStart?: boolean;
   emitDataOnStop?: boolean;
   mimeType?: string;
   startError?: Error;
+  startErrorOnce?: Error;
 } = {}) {
   const {
     emitDataOnStart = true,
     emitDataOnStop = false,
     mimeType = "audio/webm",
-    startError
+    startError,
+    startErrorOnce
   } = options;
+  let hasThrownStartErrorOnce = false;
 
   return class FakeMediaRecorder {
     ondataavailable: ((event: { data: Blob }) => void) | null = null;
@@ -123,6 +186,10 @@ function createFakeMediaRecorder(options: {
 
     start() {
       if (startError) throw startError;
+      if (startErrorOnce && !hasThrownStartErrorOnce) {
+        hasThrownStartErrorOnce = true;
+        throw startErrorOnce;
+      }
       if (emitDataOnStart) this.emitAudio();
     }
 
