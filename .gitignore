@@ -1,4 +1,13 @@
 .superpowers/
 .worktrees/
-# Added by code-review-graph
+node_modules/
+apps/*/dist/
+apps/*/.vite/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+/data/
+/models/
+*.pyc
 .code-review-graph/
