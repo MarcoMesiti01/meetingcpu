@@ -11,17 +11,29 @@ export class BrowserAudioRecorder {
   ) {}
 
   async start(): Promise<void> {
-    this.stream = await this.getUserMedia({ audio: true });
+    if (this.mediaRecorder) {
+      throw new Error("Recording is already in progress.");
+    }
+
+    const stream = await this.getUserMedia({ audio: true });
+    this.stream = stream;
     this.chunks = [];
-    this.mediaRecorder = new this.MediaRecorderCtor(this.stream);
-    this.mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        this.chunks.push(event.data);
-      } else if (this.chunks.length === 0) {
-        this.chunks.push(event.data);
-      }
-    };
-    this.mediaRecorder.start();
+
+    try {
+      const mediaRecorder = new this.MediaRecorderCtor(stream);
+      this.mediaRecorder = mediaRecorder;
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          this.chunks.push(event.data);
+        } else if (this.chunks.length === 0) {
+          this.chunks.push(event.data);
+        }
+      };
+      mediaRecorder.start();
+    } catch (error) {
+      this.reset();
+      throw error;
+    }
   }
 
   async stop(): Promise<Blob> {
@@ -30,13 +42,30 @@ export class BrowserAudioRecorder {
     }
 
     const recorder = this.mediaRecorder;
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       recorder.onstop = () => {
-        this.stream?.getTracks().forEach((track) => track.stop());
-        const type = this.chunks[0]?.type || "audio/webm";
-        resolve(new Blob(this.chunks, { type }));
+        const chunks = this.chunks;
+        const type = chunks[0]?.type || "audio/webm";
+        this.reset();
+        resolve(new Blob(chunks, { type }));
       };
-      recorder.stop();
+      try {
+        recorder.stop();
+      } catch (error) {
+        this.reset();
+        reject(error);
+      }
     });
+  }
+
+  private reset() {
+    if (this.mediaRecorder) {
+      this.mediaRecorder.ondataavailable = null;
+      this.mediaRecorder.onstop = null;
+    }
+    this.stream?.getTracks().forEach((track) => track.stop());
+    this.mediaRecorder = null;
+    this.stream = null;
+    this.chunks = [];
   }
 }
