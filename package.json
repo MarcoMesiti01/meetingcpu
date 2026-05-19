@@ -1,0 +1,23 @@
+{
+  "name": "meetingcpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/web",
+    "apps/server"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/setup-python.mjs",
+    "dev": "node scripts/dev.mjs",
+    "test": "npm run test --workspaces --if-present && npm run test:python",
+    "test:python": ".venv/Scripts/python -m pytest services/whisper/tests",
+    "build": "npm run build --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

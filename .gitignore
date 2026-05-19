@@ -1,0 +1,12 @@
+.superpowers/
+.worktrees/
+node_modules/
+apps/*/dist/
+apps/*/.vite/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+/data/
+/models/
+*.pyc

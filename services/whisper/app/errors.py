@@ -1,0 +1,2 @@
+class AudioUnreadableError(Exception):
+    pass
