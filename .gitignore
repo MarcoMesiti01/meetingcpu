@@ -1,2 +1,4 @@
 .superpowers/
 .worktrees/
+# Added by code-review-graph
+.code-review-graph/
