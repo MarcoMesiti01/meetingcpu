@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
@@ -13,9 +13,21 @@ const testPython = args[0] === "--test-python";
 const modelIds = downloadOnly ? args.slice(1) : ["small"];
 
 if (testPython) {
-  run(venvPython, ["-m", "pytest", "services/whisper/tests"], "run whisper service tests", {
-    hint: "Run npm install first to create the Python virtual environment and install test dependencies."
-  });
+  const pytestTemp = join(process.cwd(), ".pytest_tmp");
+  mkdirSync(pytestTemp, { recursive: true });
+  run(
+    venvPython,
+    ["-m", "pytest", "-p", "no:cacheprovider", "--basetemp", join(pytestTemp, "basetemp"), "services/whisper/tests"],
+    "run whisper service tests",
+    {
+      env: {
+        ...process.env,
+        TEMP: pytestTemp,
+        TMP: pytestTemp
+      },
+      hint: "Run npm install first to create the Python virtual environment and install test dependencies."
+    }
+  );
   process.exit(0);
 }
 
@@ -48,7 +60,7 @@ for (const modelId of modelIds.length > 0 ? modelIds : ["small"]) {
 
 function run(command, args, label, options = {}) {
   console.log(`[setup] ${label}`);
-  const result = spawnSync(command, args, { stdio: "inherit", shell: false });
+  const result = spawnSync(command, args, { stdio: "inherit", shell: false, env: options.env ?? process.env });
   if (result.error) {
     console.error(`[setup] Attempted: ${[command, ...args].join(" ")}`);
     console.error(`[setup] Error: ${result.error.message}`);

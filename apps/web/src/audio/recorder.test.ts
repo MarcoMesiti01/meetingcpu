@@ -70,11 +70,16 @@ describe("BrowserAudioRecorder", () => {
       .mockResolvedValueOnce(stream)
       .mockResolvedValueOnce(retryStream);
     const FakeMediaRecorder = createFakeMediaRecorder();
-    const RecorderCtor = vi.fn()
-      .mockImplementationOnce(() => {
-        throw new Error("unsupported recorder");
-      })
-      .mockImplementation((nextStream: MediaStream) => new FakeMediaRecorder(nextStream)) as unknown as typeof MediaRecorder;
+    let constructionCount = 0;
+    class RecorderCtor extends FakeMediaRecorder {
+      constructor(nextStream: MediaStream) {
+        constructionCount += 1;
+        if (constructionCount === 1) {
+          throw new Error("unsupported recorder");
+        }
+        super(nextStream);
+      }
+    }
     const recorder = new BrowserAudioRecorder(getUserMedia, RecorderCtor);
 
     await expect(recorder.start()).rejects.toThrow("unsupported recorder");
@@ -140,7 +145,7 @@ describe("BrowserAudioRecorder", () => {
     await recorder.start();
     const blob = await recorder.stop();
 
-    expect(await blob.text()).toBe("audio");
+    expect(await readBlobAsText(blob)).toBe("audio");
     expect(blob.type).toBe("audio/webm");
   });
 });
@@ -160,6 +165,15 @@ function createDeferred<T>() {
   });
 
   return { promise, resolve };
+}
+
+function readBlobAsText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read blob."));
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.readAsText(blob);
+  });
 }
 
 function createFakeMediaRecorder(options: {
