@@ -10,8 +10,9 @@
   "scripts": {
     "postinstall": "node scripts/setup-python.mjs",
     "dev": "node scripts/dev.mjs",
+    "download:model": "node scripts/setup-python.mjs --download-model",
     "test": "npm run test --workspaces --if-present && npm run test:python",
-    "test:python": ".venv/Scripts/python -m pytest services/whisper/tests",
+    "test:python": "node scripts/setup-python.mjs --test-python",
     "build": "npm run build --workspaces --if-present"
   },
   "engines": {

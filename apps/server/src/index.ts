@@ -8,6 +8,6 @@ const app = createApp({
   transcriptionClient: createTranscriptionClient(config.transcriptionServiceUrl)
 });
 
-app.listen(config.port, () => {
-  console.log(`meetingcpu API listening on http://127.0.0.1:${config.port}`);
+app.listen(config.port, config.host, () => {
+  console.log(`meetingcpu API listening on http://${config.host}:${config.port}`);
 });

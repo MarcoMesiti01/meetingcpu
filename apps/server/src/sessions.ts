@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import type { ModelId } from "./models.js";
 
@@ -55,14 +55,14 @@ export async function createSession(input: { dataRoot: string; now?: Date; title
 export async function saveRecording(input: {
   session: Session;
   originalName: string;
-  buffer: Buffer;
+  sourcePath: string;
   sourceType: SourceType;
   modelId: ModelId;
 }): Promise<{ recordingPath: string }> {
   const extension = extname(input.originalName) || ".webm";
   const baseName = input.sourceType === "microphone" ? "recording" : "upload";
   const recordingPath = join(input.session.path, `${baseName}${extension}`);
-  await writeFile(recordingPath, input.buffer);
+  await moveFile(input.sourcePath, recordingPath);
   await writeMetadata(input.session, {
     sessionId: input.session.id,
     sourceType: input.sourceType,
@@ -72,6 +72,23 @@ export async function saveRecording(input: {
     updatedAt: new Date().toISOString()
   });
   return { recordingPath };
+}
+
+export async function saveFailedTranscription(input: {
+  session: Session;
+  modelId: ModelId;
+  error: { code: string; message: string };
+}): Promise<void> {
+  await writeMetadata(input.session, {
+    sessionId: input.session.id,
+    modelId: input.modelId,
+    status: "transcription-failed",
+    error: {
+      code: input.error.code,
+      message: input.error.message
+    },
+    updatedAt: new Date().toISOString()
+  });
 }
 
 export async function saveTranscript(input: {
@@ -102,6 +119,19 @@ async function readMetadata(session: Session): Promise<Record<string, unknown>> 
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") {
       return {};
+    }
+    throw error;
+  }
+}
+
+async function moveFile(sourcePath: string, destinationPath: string): Promise<void> {
+  try {
+    await rename(sourcePath, destinationPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "EXDEV") {
+      await copyFile(sourcePath, destinationPath);
+      await unlink(sourcePath);
+      return;
     }
     throw error;
   }

@@ -1,19 +1,34 @@
 import sys
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError as exc:
-    print(
-        "[setup] faster-whisper dependencies are not installed. "
-        "Run the setup step to install whisper service dependencies.",
-        file=sys.stderr,
-    )
-    print(f"[setup] Import error: {exc}", file=sys.stderr)
-    sys.exit(1)
-
+MODEL_IDS = {
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3-turbo",
+    "distil-large-v3",
+}
 
 def main():
     model_id = sys.argv[1] if len(sys.argv) > 1 else "small"
+    if model_id not in MODEL_IDS:
+        print(
+            f"[setup] Unknown model '{model_id}'. Choose one of: {', '.join(sorted(MODEL_IDS))}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        print(
+            "[setup] faster-whisper dependencies are not installed. "
+            "Run the setup step to install whisper service dependencies.",
+            file=sys.stderr,
+        )
+        print(f"[setup] Import error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     print(f"[setup] Downloading faster-whisper model: {model_id}")
     try:
         WhisperModel(

@@ -19,7 +19,21 @@ npm run dev
 
 ## Models
 
-The app exposes `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `distil-large-v3`. `small` is the default CPU-friendly model. Larger models may be slow or fail on memory-limited laptops.
+The app exposes `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `distil-large-v3`. `small` is the default CPU-friendly model and is the only model downloaded by `npm install`. Larger models may be slow or fail on memory-limited laptops.
+
+Download any additional selectable model before using it offline:
+
+```bash
+npm run download:model -- medium
+```
+
+You can pass more than one model name:
+
+```bash
+npm run download:model -- tiny base distil-large-v3
+```
+
+The download step needs network access. After a model is present under `models/`, that model can be used offline.
 
 ## Saved Sessions
 

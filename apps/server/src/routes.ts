@@ -1,7 +1,18 @@
+import { mkdir, unlink } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { extname, join } from "node:path";
 import { Router, type NextFunction, type Request, type RequestHandler, type Response } from "express";
 import multer from "multer";
 import { DEFAULT_MODEL_ID, listModelOptions, parseModelId, type ModelId } from "./models.js";
-import { createSession, saveRecording, saveTranscript, type Session, type SourceType, type TranscriptResult } from "./sessions.js";
+import {
+  createSession,
+  saveFailedTranscription,
+  saveRecording,
+  saveTranscript,
+  type Session,
+  type SourceType,
+  type TranscriptResult
+} from "./sessions.js";
 
 export interface TranscriptionClient {
   health(): Promise<{ ok: boolean; service: string }>;
@@ -11,17 +22,28 @@ export interface TranscriptionClient {
 export interface RouteDependencies {
   dataRoot: string;
   transcriptionClient: TranscriptionClient;
+  maxAudioUploadBytes?: number;
 }
 
 const MAX_AUDIO_UPLOAD_BYTES = 500 * 1024 * 1024;
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_AUDIO_UPLOAD_BYTES }
-});
-
 export function createRoutes(dependencies: RouteDependencies): Router {
   const router = Router();
+  const maxAudioUploadBytes = dependencies.maxAudioUploadBytes ?? MAX_AUDIO_UPLOAD_BYTES;
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (_request, _file, callback) => {
+        const uploadPath = join(dependencies.dataRoot, "uploads", "tmp");
+        void mkdir(uploadPath, { recursive: true })
+          .then(() => callback(null, uploadPath))
+          .catch((error: unknown) => callback(error as Error, uploadPath));
+      },
+      filename: (_request, file, callback) => {
+        callback(null, `${randomUUID()}${extname(file.originalname) || ".tmp"}`);
+      }
+    }),
+    limits: { fileSize: maxAudioUploadBytes }
+  });
 
   router.get("/health", async (_request, response) => {
     response.json({ ok: true });
@@ -37,6 +59,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
   router.post("/transcriptions", upload.single("audio"), asyncHandler(async (request, response) => {
     const modelResult = parseModelId(String(request.body.modelId ?? ""));
     if (!modelResult.ok) {
+      await cleanupUploadedFile(request.file);
       response.status(400).json(modelResult.error);
       return;
     }
@@ -58,7 +81,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       const saved = await saveRecording({
         session,
         originalName: request.file.originalname,
-        buffer: request.file.buffer,
+        sourcePath: request.file.path,
         sourceType,
         modelId: modelResult.value
       });
@@ -77,11 +100,33 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         transcript
       });
     } catch (error) {
+      if (session && recordingPath) {
+        await saveFailedTranscription({
+          session,
+          modelId: modelResult.value,
+          error: transcriptionErrorBody(error)
+        });
+      }
+      await cleanupUploadedFile(request.file);
       respondWithTranscriptionError(response, error, { session, recordingPath });
     }
   }));
 
   return router;
+}
+
+async function cleanupUploadedFile(file: Express.Multer.File | undefined): Promise<void> {
+  if (!file?.path) {
+    return;
+  }
+
+  try {
+    await unlink(file.path);
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw error;
+    }
+  }
 }
 
 function asyncHandler(handler: (request: Request, response: Response, next: NextFunction) => Promise<void>): RequestHandler {
@@ -105,6 +150,14 @@ function respondWithTranscriptionError(
     ...(context.session ? { sessionId: context.session.id, sessionPath: context.session.path } : {}),
     ...(context.recordingPath ? { recordingPath: context.recordingPath } : {})
   });
+}
+
+function transcriptionErrorBody(error: unknown): { code: string; message: string } {
+  if (isStructuredTranscriptionError(error)) {
+    return { code: error.code, message: error.message };
+  }
+
+  return { code: "TRANSCRIPTION_REQUEST_FAILED", message: "Transcription request failed." };
 }
 
 function statusFromError(error: unknown): number {
@@ -138,4 +191,8 @@ function hasStringProperty(error: object, property: "code" | "message"): error i
 
 function parseSourceType(value: unknown): SourceType {
   return value === "upload" ? "upload" : "microphone";
+}
+
+function isNodeError(error: unknown): error is Error & { code?: string } {
+  return error instanceof Error && "code" in error;
 }

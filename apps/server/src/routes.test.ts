@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import request from "supertest";
@@ -15,6 +15,22 @@ describe("server routes", () => {
     const response = await request(app).get("/api/models").expect(200);
     expect(response.body.defaultModelId).toBe("small");
     expect(response.body.models.map((model: { id: string }) => model.id)).toContain("distil-large-v3");
+  });
+
+  it("sets CORS headers only for local browser origins", async () => {
+    const app = createApp({
+      dataRoot: await mkdtemp(join(tmpdir(), "meetingcpu-")),
+      transcriptionClient: fakeTranscriptionClient()
+    });
+
+    await request(app)
+      .get("/api/health")
+      .set("Origin", "http://localhost:5173")
+      .expect(200)
+      .expect("Access-Control-Allow-Origin", "http://localhost:5173");
+
+    const disallowed = await request(app).get("/api/health").set("Origin", "https://example.com").expect(200);
+    expect(disallowed.headers["access-control-allow-origin"]).toBeUndefined();
   });
 
   it("saves a microphone recording and returns a transcript", async () => {
@@ -52,6 +68,7 @@ describe("server routes", () => {
     await expect(readFile(join(dataRoot, "sessions", response.body.sessionId, "transcript.txt"), "utf8")).resolves.toBe(
       "Local transcript.\n"
     );
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
   it("rejects unknown model ids before saving work", async () => {
@@ -99,8 +116,40 @@ describe("server routes", () => {
     const sessionId = response.body.sessionId;
     const sessionPath = join(dataRoot, "sessions", sessionId);
     await expect(readFile(join(sessionPath, "recording.webm"), "utf8")).resolves.toBe("audio");
+    const metadata = JSON.parse(await readFile(join(sessionPath, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      sourceType: "microphone",
+      modelId: "small",
+      error: {
+        code: "MODEL_UNAVAILABLE",
+        message: "Model is not available locally."
+      }
+    });
     await expect(access(join(sessionPath, "transcript.txt"))).rejects.toThrow();
     await expect(access(join(sessionPath, "transcript.json"))).rejects.toThrow();
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
+  it("returns a controlled error when uploads exceed the size limit", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      maxAudioUploadBytes: 4
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "microphone")
+      .field("modelId", "small")
+      .attach("audio", Buffer.from("audio-too-large"), "recording.webm")
+      .expect(413);
+
+    expect(response.body).toEqual({
+      code: "AUDIO_TOO_LARGE",
+      message: "Audio uploads must be 500 MB or smaller."
+    });
   });
 });
 

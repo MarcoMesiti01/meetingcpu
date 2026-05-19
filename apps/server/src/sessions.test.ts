@@ -1,8 +1,14 @@
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { createSession, saveRecording, saveTranscript, sessionSlugFromDate } from "./sessions.js";
+import {
+  createSession,
+  saveFailedTranscription,
+  saveRecording,
+  saveTranscript,
+  sessionSlugFromDate
+} from "./sessions.js";
 
 describe("session storage", () => {
   it("creates a safe dated session folder", async () => {
@@ -44,11 +50,13 @@ describe("session storage", () => {
       now: new Date("2026-05-18T13:30:00.000Z"),
       title: "Local Meeting"
     });
+    const uploadPath = join(root, "upload.webm");
+    await writeFile(uploadPath, "audio-bytes");
 
     const saved = await saveRecording({
       session,
       originalName: "meeting.webm",
-      buffer: Buffer.from("audio-bytes"),
+      sourcePath: uploadPath,
       sourceType: "microphone",
       modelId: "small"
     });
@@ -94,10 +102,12 @@ describe("session storage", () => {
       now: new Date("2026-05-18T13:30:00.000Z"),
       title: "Metadata"
     });
+    const uploadPath = join(root, "metadata-upload.webm");
+    await writeFile(uploadPath, "audio-bytes");
     const saved = await saveRecording({
       session,
       originalName: "meeting.webm",
-      buffer: Buffer.from("audio-bytes"),
+      sourcePath: uploadPath,
       sourceType: "microphone",
       modelId: "small"
     });
@@ -123,6 +133,44 @@ describe("session storage", () => {
       durationSeconds: 3.2,
       modelId: "small"
     });
+  });
+
+  it("preserves recording metadata when saving failed transcription metadata", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const session = await createSession({
+      dataRoot: root,
+      now: new Date("2026-05-18T13:30:00.000Z"),
+      title: "Failure Metadata"
+    });
+    const uploadPath = join(root, "failure-upload.webm");
+    await writeFile(uploadPath, "audio-bytes");
+    const saved = await saveRecording({
+      session,
+      originalName: "meeting.webm",
+      sourcePath: uploadPath,
+      sourceType: "microphone",
+      modelId: "small"
+    });
+
+    await saveFailedTranscription({
+      session,
+      modelId: "small",
+      error: { code: "MODEL_UNAVAILABLE", message: "Model is not available locally." }
+    });
+
+    const metadata = JSON.parse(await readFile(join(session.path, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      sessionId: session.id,
+      sourceType: "microphone",
+      recordingPath: saved.recordingPath,
+      status: "transcription-failed",
+      modelId: "small",
+      error: {
+        code: "MODEL_UNAVAILABLE",
+        message: "Model is not available locally."
+      }
+    });
+    expect(typeof metadata.updatedAt).toBe("string");
   });
 
   it("normalizes empty titles to local meeting", () => {

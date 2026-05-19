@@ -61,7 +61,7 @@ const MODEL_OPTIONS: ModelOption[] = [
     speed: "very-slow",
     recommended: false,
     computeType: "int8",
-    warning: "Experimental on CPU. May be very slow or fail on memory-limited machines."
+    warning: "experimental on CPU. May be very slow or fail on memory-limited machines."
   },
   {
     id: "distil-large-v3",
@@ -70,7 +70,7 @@ const MODEL_OPTIONS: ModelOption[] = [
     speed: "very-slow",
     recommended: false,
     computeType: "int8",
-    warning: "Experimental on CPU. May be very slow or fail on memory-limited machines."
+    warning: "experimental on CPU. May be very slow or fail on memory-limited machines."
   }
 ];
 

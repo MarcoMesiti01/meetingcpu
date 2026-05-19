@@ -7,6 +7,17 @@ const venvPython = isWindows ? join(".venv", "Scripts", "python.exe") : join(".v
 const pythonCommand = process.env.PYTHON ?? (isWindows ? "py" : "python3");
 const pythonArgs = process.env.PYTHON ? [] : isWindows ? ["-3"] : [];
 const pythonHint = "Install Python 3.9+ or set PYTHON to a Python executable path.";
+const args = process.argv.slice(2);
+const downloadOnly = args[0] === "--download-model";
+const testPython = args[0] === "--test-python";
+const modelIds = downloadOnly ? args.slice(1) : ["small"];
+
+if (testPython) {
+  run(venvPython, ["-m", "pytest", "services/whisper/tests"], "run whisper service tests", {
+    hint: "Run npm install first to create the Python virtual environment and install test dependencies."
+  });
+  process.exit(0);
+}
 
 if (!existsSync(venvPython)) {
   const venvArgs = [...pythonArgs, "-m", "venv", ".venv"];
@@ -27,7 +38,13 @@ if (!existsSync(venvPython)) {
 
 run(venvPython, ["-m", "pip", "install", "--upgrade", "pip"], "upgrade pip");
 run(venvPython, ["-m", "pip", "install", "-r", "services/whisper/requirements.txt"], "install whisper service dependencies");
-run(venvPython, ["scripts/download-model.py", "small"], "download default small model");
+for (const modelId of modelIds.length > 0 ? modelIds : ["small"]) {
+  run(
+    venvPython,
+    ["scripts/download-model.py", modelId],
+    downloadOnly ? `download ${modelId} model` : "download default small model"
+  );
+}
 
 function run(command, args, label, options = {}) {
   console.log(`[setup] ${label}`);
