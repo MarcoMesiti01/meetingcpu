@@ -89,4 +89,23 @@ describe("transcription client", () => {
       message: "Transcription service is unreachable: connect ECONNREFUSED 127.0.0.1:8765"
     });
   });
+
+  it("turns malformed transcription responses into structured local errors", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        text: "Hello.",
+        language: "en",
+        durationSeconds: 1.5,
+        segments: "not-segments"
+      })
+    });
+
+    const client = createTranscriptionClient("http://127.0.0.1:8765", fetchMock);
+    await expect(client.transcribe({ audioPath: "a.webm", modelId: "small", language: null })).rejects.toMatchObject({
+      code: "TRANSCRIPTION_SERVICE_RESPONSE_INVALID",
+      status: 502,
+      message: "Transcription service returned an invalid transcription response."
+    });
+  });
 });

@@ -1,4 +1,4 @@
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, readFile, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { extname, join } from "node:path";
 import { Router, type NextFunction, type Request, type RequestHandler, type Response } from "express";
@@ -62,6 +62,7 @@ export interface RouteChunkSessionState {
   modelId: ModelId;
   language: string | null;
   diarization: boolean;
+  status: "recording" | "finalizing" | "finalized";
 }
 
 export interface RouteDependencies {
@@ -159,7 +160,8 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       session,
       modelId: modelResult.value,
       language: request.body.language ? String(request.body.language) : null,
-      diarization: parseBoolean(request.body.diarization)
+      diarization: parseBoolean(request.body.diarization),
+      status: "recording"
     };
     chunkSessionStore.set(session.id, state);
     events.publish({
@@ -200,6 +202,12 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
+    if (state.status !== "recording") {
+      await cleanupUploadedFile(request.file);
+      response.status(state.status === "finalized" ? 410 : 409).json(sessionClosedBody(state.status));
+      return;
+    }
+
     if (!request.file) {
       response.status(400).json({ code: "AUDIO_REQUIRED", message: "Attach an audio file using the 'audio' field." });
       return;
@@ -212,26 +220,72 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
-    const saved = await saveChunkFile({
-      session: state.session,
-      sourcePath: request.file.path,
-      index: chunkFields.value.chunkIndex,
-      startSeconds: chunkFields.value.startSeconds,
-      endSeconds: chunkFields.value.endSeconds,
-      overlapSeconds: chunkFields.value.overlapSeconds,
-      mimeType: request.file.mimetype || String(request.body.mimeType ?? "audio/webm"),
-      originalName: request.file.originalname
-    });
-    events.publish({ type: "chunk-saved", sessionId: state.session.id, chunkIndex: saved.index });
-    void chunkQueue.enqueue({
-      sessionId: state.session.id,
-      chunkIndex: saved.index,
-      session: state.session,
-      chunkPath: saved.path,
-      modelId: state.modelId,
-      language: state.language,
-      diarization: state.diarization
-    });
+    if (await chunkIndexExists(state.session, chunkFields.value.chunkIndex)) {
+      await cleanupUploadedFile(request.file);
+      response.status(409).json({
+        code: "DUPLICATE_CHUNK_INDEX",
+        message: `Chunk index ${chunkFields.value.chunkIndex} has already been uploaded.`
+      });
+      return;
+    }
+
+    let saved: Awaited<ReturnType<typeof saveChunkFile>> | null = null;
+    try {
+      saved = await saveChunkFile({
+        session: state.session,
+        sourcePath: request.file.path,
+        index: chunkFields.value.chunkIndex,
+        startSeconds: chunkFields.value.startSeconds,
+        endSeconds: chunkFields.value.endSeconds,
+        overlapSeconds: chunkFields.value.overlapSeconds,
+        mimeType: request.file.mimetype || String(request.body.mimeType ?? "audio/webm"),
+        originalName: request.file.originalname
+      });
+    } catch {
+      await cleanupUploadedFile(request.file);
+      response.status(500).json({
+        code: "CHUNK_UPLOAD_FAILED",
+        message: "Chunk could not be saved for transcription."
+      });
+      return;
+    } finally {
+      if (!saved) {
+        await cleanupUploadedFile(request.file);
+      }
+    }
+
+    try {
+      events.publish({ type: "chunk-saved", sessionId: state.session.id, chunkIndex: saved.index });
+      void chunkQueue.enqueue({
+        sessionId: state.session.id,
+        chunkIndex: saved.index,
+        session: state.session,
+        chunkPath: saved.path,
+        modelId: state.modelId,
+        language: state.language,
+        diarization: state.diarization
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Chunk queue failed.";
+      await markChunkFailed({
+        session: state.session,
+        chunkIndex: saved.index,
+        code: "CHUNK_QUEUE_FAILED",
+        message
+      });
+      events.publish({
+        type: "chunk-failed",
+        sessionId: state.session.id,
+        chunkIndex: saved.index,
+        code: "CHUNK_QUEUE_FAILED",
+        message
+      });
+      response.status(500).json({
+        code: "CHUNK_UPLOAD_FAILED",
+        message: "Chunk could not be queued for transcription."
+      });
+      return;
+    }
 
     response.status(202).json({
       sessionId: state.session.id,
@@ -247,14 +301,28 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
-    await chunkQueue.waitForSession(state.session.id);
-    const finalized = await finalizeChunkSession({ session: state.session });
+    if (state.status !== "recording") {
+      response.status(state.status === "finalized" ? 410 : 409).json(sessionClosedBody(state.status));
+      return;
+    }
+
+    state.status = "finalizing";
+    let finalized: Awaited<ReturnType<typeof finalizeChunkSession>>;
+    try {
+      await chunkQueue.waitForSession(state.session.id);
+      finalized = await finalizeChunkSession({ session: state.session });
+    } catch (error) {
+      state.status = "recording";
+      throw error;
+    }
+    state.status = "finalized";
     events.publish({
       type: "session-finalized",
       sessionId: state.session.id,
       transcriptPath: finalized.transcriptPath,
       partial: finalized.partial
     });
+    chunkSessionStore.delete(state.session.id);
 
     response.json({
       sessionId: state.session.id,
@@ -471,7 +539,50 @@ function parseChunkFields(
     };
   }
 
+  if (
+    chunkIndex < 1 ||
+    startSeconds < 0 ||
+    endSeconds <= startSeconds ||
+    overlapSeconds < 0 ||
+    overlapSeconds >= endSeconds - startSeconds
+  ) {
+    return {
+      ok: false,
+      error: {
+        code: "INVALID_CHUNK_METADATA",
+        message:
+          "Chunk metadata requires chunkIndex >= 1, startSeconds >= 0, endSeconds > startSeconds, and a non-negative overlapSeconds shorter than the chunk duration."
+      }
+    };
+  }
+
   return { ok: true, value: { chunkIndex, startSeconds, endSeconds, overlapSeconds } };
+}
+
+async function chunkIndexExists(session: ChunkSession, chunkIndex: number): Promise<boolean> {
+  try {
+    const manifest = JSON.parse(await readFile(session.manifestPath, "utf8")) as Array<{ index?: unknown }>;
+    return manifest.some((entry) => entry.index === chunkIndex);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function sessionClosedBody(status: "finalizing" | "finalized"): { code: string; message: string } {
+  if (status === "finalizing") {
+    return {
+      code: "SESSION_FINALIZING",
+      message: "Session is finalizing and no longer accepts chunks."
+    };
+  }
+
+  return {
+    code: "SESSION_FINALIZED",
+    message: "Session has been finalized and no longer accepts chunks."
+  };
 }
 
 function parseIntegerField(value: unknown): number | null {

@@ -184,6 +184,176 @@ describe("server routes", () => {
     expect(finalized.body.partial).toBe(false);
   });
 
+  it("rejects late chunks while a session is finalizing", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    let resolveWait!: () => void;
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveWait = resolve;
+          })
+      )
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Finalizing", modelId: "small" }).expect(201);
+
+    const finalizeResponse = request(app)
+      .post(`/api/sessions/${created.body.sessionId}/finalize`)
+      .expect(200)
+      .then((response) => response);
+    await vi.waitFor(() => expect(chunkQueue.waitForSession).toHaveBeenCalledWith(created.body.sessionId));
+
+    const lateChunk = await request(app)
+      .post(`/api/sessions/${created.body.sessionId}/chunks`)
+      .field("chunkIndex", "1")
+      .field("startSeconds", "0")
+      .field("endSeconds", "2")
+      .field("overlapSeconds", "0")
+      .attach("audio", Buffer.from("late-chunk"), "late.webm")
+      .expect(409);
+
+    expect(lateChunk.body).toEqual({
+      code: "SESSION_FINALIZING",
+      message: "Session is finalizing and no longer accepts chunks."
+    });
+    expect(chunkQueue.enqueue).not.toHaveBeenCalled();
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+
+    resolveWait();
+    await finalizeResponse;
+  });
+
+  it("returns terminal JSON for chunks and events after a session is finalized", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const events = new SessionEventHub();
+    const published: string[] = [];
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      events
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Closed", modelId: "small" }).expect(201);
+    events.subscribe(created.body.sessionId, (event) => published.push(event.type));
+
+    await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(200);
+
+    const lateChunk = await request(app)
+      .post(`/api/sessions/${created.body.sessionId}/chunks`)
+      .field("chunkIndex", "1")
+      .field("startSeconds", "0")
+      .field("endSeconds", "2")
+      .field("overlapSeconds", "0")
+      .attach("audio", Buffer.from("late-chunk"), "late.webm")
+      .expect(404);
+    const lateEvents = await request(app).get(`/api/sessions/${created.body.sessionId}/events`).expect(404);
+
+    expect(lateChunk.body.code).toBe("SESSION_NOT_FOUND");
+    expect(lateEvents.body.code).toBe("SESSION_NOT_FOUND");
+    expect(lateEvents.headers["content-type"]).not.toContain("text/event-stream");
+    expect(published).toContain("session-finalized");
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
+  it("rejects invalid chunk metadata before saving work", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Metadata", modelId: "small" }).expect(201);
+
+    const invalidMetadata = [
+      { chunkIndex: "0", startSeconds: "0", endSeconds: "2", overlapSeconds: "0" },
+      { chunkIndex: "1.5", startSeconds: "0", endSeconds: "2", overlapSeconds: "0" },
+      { chunkIndex: "1", startSeconds: "-1", endSeconds: "2", overlapSeconds: "0" },
+      { chunkIndex: "1", startSeconds: "2", endSeconds: "2", overlapSeconds: "0" },
+      { chunkIndex: "1", startSeconds: "0", endSeconds: "2", overlapSeconds: "2" }
+    ];
+
+    for (const metadata of invalidMetadata) {
+      const response = await request(app)
+        .post(`/api/sessions/${created.body.sessionId}/chunks`)
+        .field("chunkIndex", metadata.chunkIndex)
+        .field("startSeconds", metadata.startSeconds)
+        .field("endSeconds", metadata.endSeconds)
+        .field("overlapSeconds", metadata.overlapSeconds)
+        .attach("audio", Buffer.from("invalid"), "invalid.webm")
+        .expect(400);
+
+      expect(response.body.code).toBe("INVALID_CHUNK_METADATA");
+    }
+
+    expect(chunkQueue.enqueue).not.toHaveBeenCalled();
+    await expect(readdir(join(dataRoot, "sessions", created.body.sessionId, "chunks"))).resolves.toEqual([]);
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
+  it("rejects duplicate chunk indexes before overwriting the manifest", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Duplicates", modelId: "small" }).expect(201);
+
+    await uploadChunk(app, created.body.sessionId, 1, "first").expect(202);
+    const duplicate = await uploadChunk(app, created.body.sessionId, 1, "second").expect(409);
+
+    expect(duplicate.body).toEqual({
+      code: "DUPLICATE_CHUNK_INDEX",
+      message: "Chunk index 1 has already been uploaded."
+    });
+    expect(chunkQueue.enqueue).toHaveBeenCalledTimes(1);
+    await expect(readdir(join(dataRoot, "sessions", created.body.sessionId, "chunks"))).resolves.toEqual([
+      "chunk-000001.webm"
+    ]);
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
+  it("returns a controlled error and cleans temp uploads when enqueue fails synchronously", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkQueue = {
+      enqueue: vi.fn(() => {
+        throw new Error("queue is unavailable");
+      }),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Queue failure", modelId: "small" }).expect(201);
+
+    const response = await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(500);
+
+    expect(response.body).toEqual({
+      code: "CHUNK_UPLOAD_FAILED",
+      message: "Chunk could not be queued for transcription."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(await readFile(join(dataRoot, "sessions", created.body.sessionId, "metadata.json"), "utf8"));
+    expect(metadata.failedChunks).toEqual([
+      { chunkIndex: 1, code: "CHUNK_QUEUE_FAILED", message: "queue is unavailable" }
+    ]);
+  });
+
   it("records failed chunks, emits chunk-failed, and finalizes a partial transcript", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const events = new SessionEventHub();
@@ -360,6 +530,16 @@ function close(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+}
+
+function uploadChunk(app: ReturnType<typeof createApp>, sessionId: string, chunkIndex: number, contents: string) {
+  return request(app)
+    .post(`/api/sessions/${sessionId}/chunks`)
+    .field("chunkIndex", String(chunkIndex))
+    .field("startSeconds", String((chunkIndex - 1) * 2))
+    .field("endSeconds", String(chunkIndex * 2))
+    .field("overlapSeconds", "0")
+    .attach("audio", Buffer.from(contents), "chunk.webm");
 }
 
 function fakeTranscriptionClient() {

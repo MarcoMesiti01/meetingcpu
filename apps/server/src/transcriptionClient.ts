@@ -53,7 +53,7 @@ export function createTranscriptionClient(baseUrl: string, fetchImpl: FetchLike 
       });
 
       await throwIfServiceError(response);
-      return response.json() as Promise<TranscriptionResult>;
+      return parseTranscriptionResult(await response.json());
     }
   };
 }
@@ -100,6 +100,59 @@ function createServiceError(message: string, code: string, status: number): Tran
   error.code = code;
   error.status = status;
   return error;
+}
+
+function parseTranscriptionResult(payload: unknown): TranscriptionResult {
+  if (!isValidTranscriptionResult(payload)) {
+    throw createServiceError(
+      "Transcription service returned an invalid transcription response.",
+      "TRANSCRIPTION_SERVICE_RESPONSE_INVALID",
+      502
+    );
+  }
+
+  return {
+    text: payload.text,
+    language: payload.language,
+    durationSeconds: payload.durationSeconds,
+    segments: payload.segments,
+    ...(payload.diarization ? { diarization: payload.diarization } : {})
+  };
+}
+
+function isValidTranscriptionResult(value: unknown): value is TranscriptionResult {
+  return (
+    isRecord(value) &&
+    typeof value.text === "string" &&
+    typeof value.language === "string" &&
+    isFiniteNumber(value.durationSeconds) &&
+    Array.isArray(value.segments) &&
+    value.segments.every(isTranscriptionSegment) &&
+    (value.diarization === undefined || isDiarizationStatus(value.diarization))
+  );
+}
+
+function isTranscriptionSegment(value: unknown): value is TranscriptionSegment {
+  return (
+    isRecord(value) &&
+    isFiniteNumber(value.start) &&
+    isFiniteNumber(value.end) &&
+    typeof value.text === "string" &&
+    (value.speaker === undefined || typeof value.speaker === "string")
+  );
+}
+
+function isDiarizationStatus(value: unknown): value is DiarizationStatus {
+  return (
+    isRecord(value) &&
+    typeof value.available === "boolean" &&
+    typeof value.enabled === "boolean" &&
+    (value.error === undefined || typeof value.error === "string")
+  );
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
