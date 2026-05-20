@@ -1,12 +1,33 @@
 import type { ModelId } from "./models.js";
-import type { TranscriptResult } from "./sessions.js";
 
 export type FetchLike = typeof fetch;
+
+export interface TranscriptionSegment {
+  start: number;
+  end: number;
+  text: string;
+  speaker?: string;
+}
+
+export interface DiarizationStatus {
+  available: boolean;
+  enabled: boolean;
+  error?: string;
+}
+
+export interface TranscriptionResult {
+  text: string;
+  language: string;
+  durationSeconds: number;
+  segments: TranscriptionSegment[];
+  diarization?: DiarizationStatus;
+}
 
 export interface TranscriptionRequest {
   audioPath: string;
   modelId: ModelId;
   language: string | null;
+  diarization?: boolean;
 }
 
 export interface TranscriptionServiceError extends Error {
@@ -24,7 +45,7 @@ export function createTranscriptionClient(baseUrl: string, fetchImpl: FetchLike 
       return response.json() as Promise<{ ok: boolean; service: string }>;
     },
 
-    async transcribe(input: TranscriptionRequest): Promise<TranscriptResult> {
+    async transcribe(input: TranscriptionRequest): Promise<TranscriptionResult> {
       const response = await fetchService(fetchImpl, `${normalizedBaseUrl}/transcribe`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -32,7 +53,7 @@ export function createTranscriptionClient(baseUrl: string, fetchImpl: FetchLike 
       });
 
       await throwIfServiceError(response);
-      return response.json() as Promise<TranscriptResult>;
+      return response.json() as Promise<TranscriptionResult>;
     }
   };
 }

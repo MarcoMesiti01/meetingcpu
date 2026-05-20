@@ -34,7 +34,8 @@ describe("transcription client", () => {
         text: "Hello.",
         language: "en",
         durationSeconds: 1.5,
-        segments: [{ start: 0, end: 1.5, text: "Hello." }]
+        segments: [{ start: 0, end: 1.5, text: "Hello.", speaker: "Speaker 1" }],
+        diarization: { available: true, enabled: true }
       })
     });
 
@@ -42,7 +43,8 @@ describe("transcription client", () => {
     const result = await client.transcribe({
       audioPath: "C:/meeting/data/sessions/recording.webm",
       modelId: "small",
-      language: null
+      language: null,
+      diarization: true
     });
 
     expect(fetchMock).toHaveBeenCalledWith(
@@ -53,11 +55,14 @@ describe("transcription client", () => {
         body: JSON.stringify({
           audioPath: "C:/meeting/data/sessions/recording.webm",
           modelId: "small",
-          language: null
+          language: null,
+          diarization: true
         })
       })
     );
     expect(result.text).toBe("Hello.");
+    expect(result.segments[0]).toMatchObject({ text: "Hello.", speaker: "Speaker 1" });
+    expect(result).toMatchObject({ diarization: { available: true, enabled: true } });
   });
 
   it("turns service failures into structured local errors", async () => {
