@@ -54,6 +54,11 @@ run(venvPython, ["-m", "pip", "install", "-r", "services/whisper/requirements.tx
 if (downloadDiarization) {
   run(
     venvPython,
+    ["-m", "pip", "install", "pyannote.audio"],
+    "install optional diarization dependencies"
+  );
+  run(
+    venvPython,
     ["scripts/download-diarization.py", ...args.slice(1)],
     "download diarization model"
   );

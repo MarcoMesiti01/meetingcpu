@@ -4,6 +4,9 @@ from app.errors import AudioUnreadableError
 from app.model_catalog import get_model_option
 
 
+MIN_SPEAKER_OVERLAP_SECONDS = 0.1
+
+
 class LocalTranscriber:
     def __init__(self, model_cache_dir="models", cpu_threads=0, diarizer=None):
         self.model_cache_dir = model_cache_dir
@@ -76,13 +79,14 @@ class LocalTranscriber:
             if not self.diarizer.is_available():
                 return fallback
             speaker_turns = self.diarizer.diarize(audio_path)
-        except Exception as error:
+        except self._expected_diarization_errors() as error:
             return {
                 "available": False,
                 "enabled": False,
                 "error": str(error) or fallback["error"],
             }
 
+        speaker_turns = self._validate_speaker_turns(speaker_turns)
         if not speaker_turns:
             return {
                 "available": True,
@@ -90,12 +94,61 @@ class LocalTranscriber:
                 "error": "No speakers detected.",
             }
 
+        assigned_count = 0
         for segment in segment_list:
             speaker = self._speaker_for_segment(segment, speaker_turns)
             if speaker:
                 segment["speaker"] = speaker
+                assigned_count += 1
+
+        if assigned_count == 0:
+            return {
+                "available": True,
+                "enabled": False,
+                "error": "No diarization turns overlapped transcript segments.",
+            }
 
         return {"available": True, "enabled": True}
+
+    def diarization_status(self):
+        fallback = {
+            "available": False,
+            "enabled": False,
+            "error": "Diarization dependencies or local model files are unavailable.",
+        }
+        try:
+            if self.diarizer.is_available():
+                return {"available": True, "enabled": True}
+        except self._expected_diarization_errors() as error:
+            return {
+                "available": False,
+                "enabled": False,
+                "error": str(error) or fallback["error"],
+            }
+        return fallback
+
+    def _expected_diarization_errors(self):
+        from app.diarization import DiarizationUnavailable
+
+        return (DiarizationUnavailable, RuntimeError)
+
+    def _validate_speaker_turns(self, speaker_turns):
+        validated_turns = []
+        for index, turn in enumerate(speaker_turns):
+            try:
+                start = float(turn["start"])
+                end = float(turn["end"])
+                speaker = turn["speaker"]
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Malformed diarization turn at index {index}: {turn!r}"
+                ) from error
+            if end <= start or not isinstance(speaker, str) or not speaker:
+                raise ValueError(
+                    f"Malformed diarization turn at index {index}: {turn!r}"
+                )
+            validated_turns.append({"start": start, "end": end, "speaker": speaker})
+        return validated_turns
 
     def _speaker_for_segment(self, segment, speaker_turns):
         best_speaker = None
@@ -107,6 +160,9 @@ class LocalTranscriber:
                 best_overlap = overlap
                 best_speaker = turn["speaker"]
 
+        # Ignore boundary noise; pyannote turns must overlap a segment meaningfully.
+        if best_overlap < MIN_SPEAKER_OVERLAP_SECONDS:
+            return None
         return best_speaker
 
     def _load_model(self, model_id, compute_type):

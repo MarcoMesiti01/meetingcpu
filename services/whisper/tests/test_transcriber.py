@@ -1,5 +1,6 @@
 import pytest
 
+from app.diarization import DiarizationUnavailable
 from app.errors import AudioUnreadableError
 from app.transcriber import LocalTranscriber
 
@@ -39,12 +40,34 @@ class AvailableDiarizer:
         return [{"start": 0, "end": 1.0, "speaker": "Speaker 1"}]
 
 
+class OffsetDiarizer:
+    def __init__(self, turns):
+        self.turns = turns
+
+    def is_available(self):
+        return True
+
+    def diarize(self, audio_path):
+        return self.turns
+
+
 class UnavailableDiarizer:
     def is_available(self):
         return False
 
     def diarize(self, audio_path):
         raise AssertionError("unavailable diarizer should not be used")
+
+
+class ErroringDiarizer:
+    def __init__(self, error):
+        self.error = error
+
+    def is_available(self):
+        return True
+
+    def diarize(self, audio_path):
+        raise self.error
 
 
 def failing_segments():
@@ -111,3 +134,67 @@ def test_transcriber_returns_diarization_fallback_when_unavailable(tmp_path):
     assert result["diarization"]["available"] is False
     assert result["diarization"]["enabled"] is False
     assert result["diarization"]["error"]
+
+
+def test_transcriber_returns_diarization_fallback_for_expected_diarizer_errors(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(
+        diarizer=ErroringDiarizer(DiarizationUnavailable("model missing"))
+    )
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert result["diarization"] == {
+        "available": False,
+        "enabled": False,
+        "error": "model missing",
+    }
+
+
+def test_transcriber_does_not_hide_malformed_diarization_turns(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(
+        diarizer=OffsetDiarizer([{"start": 0, "end": 1.0}])
+    )
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    with pytest.raises(ValueError, match="Malformed diarization turn"):
+        transcriber.transcribe(str(audio_path), "small", None)
+
+
+def test_transcriber_disables_diarization_when_turns_do_not_overlap_segments(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(
+        diarizer=OffsetDiarizer([{"start": 3.0, "end": 4.0, "speaker": "Speaker 2"}])
+    )
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert result["segments"] == [
+        {"start": 0, "end": 1.0, "text": "Hello", "speaker": "Speaker 1"}
+    ]
+    assert result["diarization"]["available"] is True
+    assert result["diarization"]["enabled"] is False
+    assert result["diarization"]["error"]
+
+
+def test_transcriber_ignores_tiny_diarization_overlap(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(
+        diarizer=OffsetDiarizer([{"start": 0.99, "end": 2.0, "speaker": "Speaker 2"}])
+    )
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert result["segments"] == [
+        {"start": 0, "end": 1.0, "text": "Hello", "speaker": "Speaker 1"}
+    ]
+    assert result["diarization"]["available"] is True
+    assert result["diarization"]["enabled"] is False

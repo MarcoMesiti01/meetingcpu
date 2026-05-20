@@ -5,6 +5,9 @@ from app.main import create_app
 
 
 class FakeTranscriber:
+    def diarization_status(self):
+        return {"available": True, "enabled": True}
+
     def transcribe(self, audio_path, model_id, language):
         return {
             "text": "Hello from Python.",
@@ -28,6 +31,18 @@ class FailingTranscriber:
 
     def transcribe(self, audio_path, model_id, language):
         raise self.error
+
+
+class FakeHealthDiarizer:
+    def __init__(self, available, error=None):
+        self.available = available
+        self.error = error
+
+    def is_available(self):
+        return self.available
+
+    def unavailable_error(self):
+        return self.error
 
 
 def test_importing_main_does_not_require_transcriber_or_faster_whisper(monkeypatch):
@@ -57,7 +72,43 @@ def test_health_endpoint():
     client = TestClient(create_app(FakeTranscriber()))
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"ok": True, "service": "meetingcpu-whisper"}
+    assert response.json() == {
+        "ok": True,
+        "service": "meetingcpu-whisper",
+        "diarization": {"available": True, "enabled": True},
+    }
+
+
+def test_health_endpoint_reports_diarization_without_loading_transcriber(monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def reject_transcriber_and_model(name, *args, **kwargs):
+        if name in {"app.transcriber", "faster_whisper", "pyannote.audio"}:
+            raise AssertionError(f"{name} imported by /health")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_transcriber_and_model)
+    client = TestClient(
+        create_app(
+            transcriber=None,
+            health_diarizer=FakeHealthDiarizer(False, "model files are missing"),
+        )
+    )
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "service": "meetingcpu-whisper",
+        "diarization": {
+            "available": False,
+            "enabled": False,
+            "error": "model files are missing",
+        },
+    }
 
 
 def test_transcribe_endpoint_returns_transcript():

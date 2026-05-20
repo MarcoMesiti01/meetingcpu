@@ -19,6 +19,9 @@ class LocalDiarizer:
             return False
         return True
 
+    def unavailable_error(self):
+        return self._unavailable_error
+
     def diarize(self, audio_path: str) -> list[dict]:
         pipeline = self._load_pipeline()
         diarization = pipeline(audio_path)

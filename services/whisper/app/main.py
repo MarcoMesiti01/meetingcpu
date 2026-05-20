@@ -19,9 +19,16 @@ def create_default_transcriber():
     return LocalTranscriber()
 
 
-def create_app(transcriber=None):
+def create_default_diarizer():
+    from app.diarization import LocalDiarizer
+
+    return LocalDiarizer()
+
+
+def create_app(transcriber=None, health_diarizer=None):
     app = FastAPI(title="meetingcpu whisper service")
     active_transcriber = transcriber
+    active_health_diarizer = health_diarizer
 
     def get_active_transcriber():
         nonlocal active_transcriber
@@ -29,9 +36,36 @@ def create_app(transcriber=None):
             active_transcriber = create_default_transcriber()
         return active_transcriber
 
+    def get_health_diarizer():
+        nonlocal active_health_diarizer
+        if active_health_diarizer is None:
+            active_health_diarizer = create_default_diarizer()
+        return active_health_diarizer
+
+    def get_diarization_status():
+        if active_transcriber is not None and hasattr(
+            active_transcriber, "diarization_status"
+        ):
+            return active_transcriber.diarization_status()
+
+        diarizer = get_health_diarizer()
+        if diarizer.is_available():
+            return {"available": True, "enabled": True}
+
+        status = {"available": False, "enabled": False}
+        if hasattr(diarizer, "unavailable_error"):
+            error = diarizer.unavailable_error()
+            if error:
+                status["error"] = error
+        return status
+
     @app.get("/health")
     def health():
-        return {"ok": True, "service": "meetingcpu-whisper"}
+        return {
+            "ok": True,
+            "service": "meetingcpu-whisper",
+            "diarization": get_diarization_status(),
+        }
 
     @app.post("/transcribe")
     def transcribe(request: TranscribeRequest):
