@@ -29,13 +29,19 @@ export interface ChunkTranscriptSegment {
   speaker?: string;
 }
 
+export interface ChunkDiarizationStatus {
+  available: boolean;
+  enabled: boolean;
+  error?: string;
+}
+
 export interface ChunkTranscriptResult {
   chunkIndex: number;
   text: string;
   language: string;
   durationSeconds: number;
   segments: ChunkTranscriptSegment[];
-  diarization: boolean;
+  diarization: ChunkDiarizationStatus;
 }
 
 interface ChunkFailure {
@@ -164,7 +170,7 @@ export async function finalizeChunkSession(input: {
     language,
     durationSeconds,
     segments,
-    diarization: results.some((result) => result.diarization),
+    diarization: aggregateDiarization(results),
     chunks: results,
     partial
   };
@@ -211,6 +217,13 @@ function chunkExtension(originalName: string | undefined, mimeType: string): str
     return ".mp3";
   }
   return ".webm";
+}
+
+function aggregateDiarization(results: ChunkTranscriptResult[]): ChunkDiarizationStatus {
+  const available = results.some((result) => result.diarization.available);
+  const enabled = results.some((result) => result.diarization.enabled);
+  const error = enabled ? undefined : results.find((result) => result.diarization.error)?.diarization.error;
+  return error ? { available, enabled, error } : { available, enabled };
 }
 
 function resultPath(session: ChunkSession, chunkIndex: number): string {

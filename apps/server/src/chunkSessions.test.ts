@@ -80,6 +80,27 @@ describe("chunk session storage", () => {
     expect(manifest).toEqual([entry]);
   });
 
+  it("uses webm extension for browser microphone chunks without an original name", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    const sourcePath = join(root, "browser-upload.tmp");
+    await writeFile(sourcePath, "chunk-bytes");
+
+    const entry = await saveChunkFile({
+      session,
+      sourcePath,
+      index: 1,
+      startSeconds: 0,
+      endSeconds: 5,
+      overlapSeconds: 0,
+      mimeType: "audio/webm"
+    });
+
+    expect(entry.fileName).toBe("chunk-000001.webm");
+    expect(entry.path).toBe(join(session.chunksPath, "chunk-000001.webm"));
+    await expect(readFile(entry.path, "utf8")).resolves.toBe("chunk-bytes");
+  });
+
   it("saves chunk results and appends de-duplicated transcript lines", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });
@@ -102,7 +123,7 @@ describe("chunk session storage", () => {
         text: "Old overlap.\nHello there.\nNo speaker.",
         language: "en",
         durationSeconds: 10,
-        diarization: true,
+        diarization: { available: true, enabled: true },
         segments: [
           { start: 0, end: 4, text: "Old overlap.", speaker: "Speaker 1" },
           { start: 5, end: 8, text: "Hello there.", speaker: "Speaker 1" },
@@ -118,7 +139,7 @@ describe("chunk session storage", () => {
         text: "Duplicate overlap.\nNew line.",
         language: "en",
         durationSeconds: 8,
-        diarization: false,
+        diarization: { available: true, enabled: false, error: "No speakers detected." },
         segments: [
           { start: 13, end: 14, text: "Duplicate overlap.", speaker: "Speaker 2" },
           { start: 16, end: 18, text: "New line." }
@@ -155,7 +176,7 @@ describe("chunk session storage", () => {
         text: "Second chunk.",
         language: "en",
         durationSeconds: 4,
-        diarization: false,
+        diarization: { available: true, enabled: false, error: "No speakers detected." },
         segments: [{ start: 4, end: 8, text: "Second chunk." }]
       }
     });
@@ -166,7 +187,7 @@ describe("chunk session storage", () => {
         text: "First chunk.",
         language: "en",
         durationSeconds: 4,
-        diarization: false,
+        diarization: { available: false, enabled: false },
         segments: [{ start: 0, end: 4, text: "First chunk." }]
       }
     });
@@ -185,6 +206,7 @@ describe("chunk session storage", () => {
       text: "First chunk.\nSecond chunk.",
       language: "en",
       durationSeconds: 8,
+      diarization: { available: true, enabled: false, error: "No speakers detected." },
       partial: false
     });
     expect(transcriptJson.segments).toEqual([
@@ -214,7 +236,7 @@ describe("chunk session storage", () => {
         text: "Already saved.",
         language: "en",
         durationSeconds: 5,
-        diarization: false,
+        diarization: { available: false, enabled: false },
         segments: [{ start: 0, end: 5, text: "Already saved." }]
       }
     });
