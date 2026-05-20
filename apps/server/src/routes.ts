@@ -63,6 +63,8 @@ export interface RouteChunkSessionState {
   language: string | null;
   diarization: boolean;
   status: "recording" | "finalizing" | "finalized";
+  activeChunkUploads: number;
+  chunkUploadWaiters: Array<() => void>;
 }
 
 export interface RouteDependencies {
@@ -72,6 +74,7 @@ export interface RouteDependencies {
   events?: SessionEventHub;
   chunkQueue?: ChunkQueue<RouteChunkQueueInput>;
   chunkSessionStore?: Map<string, RouteChunkSessionState>;
+  saveChunkFile?: typeof saveChunkFile;
 }
 
 const MAX_AUDIO_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -85,6 +88,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
   const maxAudioUploadBytes = dependencies.maxAudioUploadBytes ?? MAX_AUDIO_UPLOAD_BYTES;
   const events = dependencies.events ?? new SessionEventHub();
   const chunkSessionStore = dependencies.chunkSessionStore ?? new Map<string, RouteChunkSessionState>();
+  const saveUploadedChunk = dependencies.saveChunkFile ?? saveChunkFile;
   const chunkQueue =
     dependencies.chunkQueue ??
     new ChunkQueue<RouteChunkQueueInput>({
@@ -161,7 +165,9 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       modelId: modelResult.value,
       language: request.body.language ? String(request.body.language) : null,
       diarization: parseBoolean(request.body.diarization),
-      status: "recording"
+      status: "recording",
+      activeChunkUploads: 0,
+      chunkUploadWaiters: []
     };
     chunkSessionStore.set(session.id, state);
     events.publish({
@@ -220,8 +226,24 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
-    if (await chunkIndexExists(state.session, chunkFields.value.chunkIndex)) {
+    const acceptedUpload = beginChunkUpload(state);
+    if (!acceptedUpload.ok) {
       await cleanupUploadedFile(request.file);
+      response.status(acceptedUpload.statusCode).json(acceptedUpload.body);
+      return;
+    }
+
+    let isDuplicateChunk: boolean;
+    try {
+      isDuplicateChunk = await chunkIndexExists(state.session, chunkFields.value.chunkIndex);
+    } catch (error) {
+      endChunkUpload(state);
+      throw error;
+    }
+
+    if (isDuplicateChunk) {
+      await cleanupUploadedFile(request.file);
+      endChunkUpload(state);
       response.status(409).json({
         code: "DUPLICATE_CHUNK_INDEX",
         message: `Chunk index ${chunkFields.value.chunkIndex} has already been uploaded.`
@@ -231,7 +253,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
     let saved: Awaited<ReturnType<typeof saveChunkFile>> | null = null;
     try {
-      saved = await saveChunkFile({
+      saved = await saveUploadedChunk({
         session: state.session,
         sourcePath: request.file.path,
         index: chunkFields.value.chunkIndex,
@@ -242,6 +264,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         originalName: request.file.originalname
       });
     } catch {
+      endChunkUpload(state);
       await cleanupUploadedFile(request.file);
       response.status(500).json({
         code: "CHUNK_UPLOAD_FAILED",
@@ -256,7 +279,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
     try {
       events.publish({ type: "chunk-saved", sessionId: state.session.id, chunkIndex: saved.index });
-      void chunkQueue.enqueue({
+      const enqueuePromise = chunkQueue.enqueue({
         sessionId: state.session.id,
         chunkIndex: saved.index,
         session: state.session,
@@ -265,25 +288,35 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         language: state.language,
         diarization: state.diarization
       });
+      void trackChunkQueueCompletion({
+        state,
+        chunkIndex: saved.index,
+        enqueuePromise,
+        events
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Chunk queue failed.";
-      await markChunkFailed({
-        session: state.session,
-        chunkIndex: saved.index,
-        code: "CHUNK_QUEUE_FAILED",
-        message
-      });
-      events.publish({
-        type: "chunk-failed",
-        sessionId: state.session.id,
-        chunkIndex: saved.index,
-        code: "CHUNK_QUEUE_FAILED",
-        message
-      });
-      response.status(500).json({
-        code: "CHUNK_UPLOAD_FAILED",
-        message: "Chunk could not be queued for transcription."
-      });
+      try {
+        await markChunkFailed({
+          session: state.session,
+          chunkIndex: saved.index,
+          code: "CHUNK_QUEUE_FAILED",
+          message
+        });
+        events.publish({
+          type: "chunk-failed",
+          sessionId: state.session.id,
+          chunkIndex: saved.index,
+          code: "CHUNK_QUEUE_FAILED",
+          message
+        });
+        response.status(500).json({
+          code: "CHUNK_UPLOAD_FAILED",
+          message: "Chunk could not be queued for transcription."
+        });
+      } finally {
+        endChunkUpload(state);
+      }
       return;
     }
 
@@ -309,6 +342,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
     state.status = "finalizing";
     let finalized: Awaited<ReturnType<typeof finalizeChunkSession>>;
     try {
+      await waitForChunkUploads(state);
       await chunkQueue.waitForSession(state.session.id);
       finalized = await finalizeChunkSession({ session: state.session });
     } catch (error) {
@@ -583,6 +617,77 @@ function sessionClosedBody(status: "finalizing" | "finalized"): { code: string; 
     code: "SESSION_FINALIZED",
     message: "Session has been finalized and no longer accepts chunks."
   };
+}
+
+function beginChunkUpload(
+  state: RouteChunkSessionState
+):
+  | { ok: true }
+  | { ok: false; statusCode: number; body: { code: string; message: string } } {
+  if (state.status !== "recording") {
+    return {
+      ok: false,
+      statusCode: state.status === "finalized" ? 410 : 409,
+      body: sessionClosedBody(state.status)
+    };
+  }
+
+  state.activeChunkUploads += 1;
+  return { ok: true };
+}
+
+function endChunkUpload(state: RouteChunkSessionState): void {
+  state.activeChunkUploads = Math.max(0, state.activeChunkUploads - 1);
+  if (state.activeChunkUploads > 0) {
+    return;
+  }
+
+  const waiters = state.chunkUploadWaiters.splice(0);
+  for (const resolve of waiters) {
+    resolve();
+  }
+}
+
+function waitForChunkUploads(state: RouteChunkSessionState): Promise<void> {
+  if (state.activeChunkUploads === 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise<void>((resolve) => {
+    state.chunkUploadWaiters.push(resolve);
+  });
+}
+
+async function trackChunkQueueCompletion(input: {
+  state: RouteChunkSessionState;
+  chunkIndex: number;
+  enqueuePromise: Promise<void>;
+  events: SessionEventHub;
+}): Promise<void> {
+  try {
+    await input.enqueuePromise;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Chunk queue failed.";
+    try {
+      await markChunkFailed({
+        session: input.state.session,
+        chunkIndex: input.chunkIndex,
+        code: "CHUNK_QUEUE_FAILED",
+        message
+      });
+      input.events.publish({
+        type: "chunk-failed",
+        sessionId: input.state.session.id,
+        chunkIndex: input.chunkIndex,
+        code: "CHUNK_QUEUE_FAILED",
+        message
+      });
+    } catch {
+      // This runs after the upload response is accepted. Keep the queue rejection handled even if persistence fails.
+    }
+  } finally {
+    endChunkUpload(input.state);
+  }
 }
 
 function parseIntegerField(value: unknown): number | null {

@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, readdir } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -352,6 +352,95 @@ describe("server routes", () => {
     expect(metadata.failedChunks).toEqual([
       { chunkIndex: 1, code: "CHUNK_QUEUE_FAILED", message: "queue is unavailable" }
     ]);
+  });
+
+  it("records failed chunk metadata when enqueue rejects asynchronously", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const events = new SessionEventHub();
+    const published: unknown[] = [];
+    const chunkQueue = {
+      enqueue: vi.fn().mockRejectedValue(new Error("worker stopped")),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue,
+      events
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Async queue failure", modelId: "small" }).expect(201);
+    events.subscribe(created.body.sessionId, (event) => published.push(event));
+
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
+
+    await vi.waitFor(async () => {
+      const metadata = JSON.parse(await readFile(join(dataRoot, "sessions", created.body.sessionId, "metadata.json"), "utf8"));
+      expect(metadata.failedChunks).toEqual([
+        { chunkIndex: 1, code: "CHUNK_QUEUE_FAILED", message: "worker stopped" }
+      ]);
+    });
+    expect(published).toContainEqual(
+      expect.objectContaining({
+        type: "chunk-failed",
+        sessionId: created.body.sessionId,
+        chunkIndex: 1,
+        code: "CHUNK_QUEUE_FAILED",
+        message: "worker stopped"
+      })
+    );
+  });
+
+  it("finalize waits for an accepted chunk upload to finish enqueue registration", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    let releaseSave!: () => void;
+    let saveStarted!: () => void;
+    const saveStartedPromise = new Promise<void>((resolve) => {
+      saveStarted = resolve;
+    });
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue,
+      saveChunkFile: vi.fn(async ({ session, sourcePath, index, startSeconds, endSeconds }) => {
+        saveStarted();
+        await new Promise<void>((resolve) => {
+          releaseSave = resolve;
+        });
+        const chunkPath = join(session.path, "chunks", "chunk-000001.webm");
+        await writeFile(chunkPath, await readFile(sourcePath));
+        return {
+          index,
+          path: chunkPath,
+          startSeconds,
+          endSeconds,
+          overlapSeconds: 0
+        };
+      })
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Lifecycle", modelId: "small" }).expect(201);
+
+    const uploadResponse = uploadChunk(app, created.body.sessionId, 1, "chunk-audio")
+      .expect(202)
+      .then((response) => response);
+    await saveStartedPromise;
+    const finalizeResponse = request(app)
+      .post(`/api/sessions/${created.body.sessionId}/finalize`)
+      .expect(200)
+      .then((response) => response);
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(chunkQueue.waitForSession).not.toHaveBeenCalled();
+
+    releaseSave();
+    await uploadResponse;
+    await finalizeResponse;
+
+    expect(chunkQueue.enqueue).toHaveBeenCalledWith(expect.objectContaining({ chunkIndex: 1 }));
+    expect(chunkQueue.waitForSession).toHaveBeenCalledWith(created.body.sessionId);
   });
 
   it("records failed chunks, emits chunk-failed, and finalizes a partial transcript", async () => {
