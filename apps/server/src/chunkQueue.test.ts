@@ -68,7 +68,9 @@ describe("chunk queue", () => {
       events: { publish: (event) => events.push(event) }
     });
 
-    await expect(queue.enqueue({ sessionId: "session-1", chunkIndex: 7 })).rejects.toThrow("Whisper service failed.");
+    await expect(queue.enqueue({ sessionId: "session-1", chunkIndex: 7 }, { rejectOnError: true })).rejects.toThrow(
+      "Whisper service failed."
+    );
 
     expect(events).toEqual([
       {
@@ -79,6 +81,68 @@ describe("chunk queue", () => {
         message: "Whisper service failed."
       }
     ]);
+  });
+
+  it("settles failed jobs when publishing the failure event throws", async () => {
+    const queue = new ChunkQueue({
+      processChunk: async () => {
+        throw new Error("Whisper service failed.");
+      },
+      events: {
+        publish: () => {
+          throw new Error("Client disconnected.");
+        }
+      }
+    });
+
+    await expect(queue.enqueue({ sessionId: "session-1", chunkIndex: 7 }, { rejectOnError: true })).rejects.toThrow(
+      "Whisper service failed."
+    );
+  });
+
+  it("does not reject fire-and-forget enqueues by default when processing fails", async () => {
+    const events: SessionEvent[] = [];
+    const queue = new ChunkQueue({
+      processChunk: async () => {
+        throw new Error("Whisper service failed.");
+      },
+      events: { publish: (event) => events.push(event) }
+    });
+
+    await expect(queue.enqueue({ sessionId: "session-1", chunkIndex: 7 })).resolves.toBeUndefined();
+
+    expect(events).toEqual([
+      {
+        type: "chunk-failed",
+        sessionId: "session-1",
+        chunkIndex: 7,
+        code: "CHUNK_PROCESSING_FAILED",
+        message: "Whisper service failed."
+      }
+    ]);
+  });
+
+  it("continues later jobs after a failed job and resolves waiters after failures", async () => {
+    const processed: number[] = [];
+    const queue = new ChunkQueue({
+      processChunk: async (input: ChunkQueueInput) => {
+        processed.push(input.chunkIndex);
+        if (input.chunkIndex === 1) {
+          throw new Error("Whisper service failed.");
+        }
+      },
+      events: { publish: () => undefined }
+    });
+
+    const first = queue.enqueue({ sessionId: "session-1", chunkIndex: 1 }, { rejectOnError: true });
+    const second = queue.enqueue({ sessionId: "session-1", chunkIndex: 2 }, { rejectOnError: true });
+    const waiting = queue.waitForSession("session-1");
+
+    await expect(first).rejects.toThrow("Whisper service failed.");
+    await expect(second).resolves.toBeUndefined();
+    await expect(waiting).resolves.toBeUndefined();
+
+    expect(processed).toEqual([1, 2]);
   });
 
   it("waits for active and queued jobs before finalization continues", async () => {

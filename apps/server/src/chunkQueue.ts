@@ -12,8 +12,13 @@ export interface ChunkQueueOptions<TInput extends ChunkQueueInput> {
   };
 }
 
+export interface ChunkQueueEnqueueOptions {
+  rejectOnError?: boolean;
+}
+
 interface QueuedJob<TInput extends ChunkQueueInput> {
   input: TInput;
+  rejectOnError: boolean;
   resolve: () => void;
   reject: (error: unknown) => void;
 }
@@ -36,9 +41,9 @@ export class ChunkQueue<TInput extends ChunkQueueInput = ChunkQueueInput> {
     this.events = options.events;
   }
 
-  enqueue(input: TInput): Promise<void> {
+  enqueue(input: TInput, options: ChunkQueueEnqueueOptions = {}): Promise<void> {
     const promise = new Promise<void>((resolve, reject) => {
-      this.jobs.push({ input, resolve, reject });
+      this.jobs.push({ input, rejectOnError: options.rejectOnError === true, resolve, reject });
     });
     this.processNext();
     return promise;
@@ -77,7 +82,11 @@ export class ChunkQueue<TInput extends ChunkQueueInput = ChunkQueueInput> {
           job.resolve();
         } catch (error) {
           this.publishFailure(job.input, error);
-          job.reject(error);
+          if (job.rejectOnError) {
+            job.reject(error);
+          } else {
+            job.resolve();
+          }
         } finally {
           this.activeJob = null;
           this.resolveReadyWaiters();
@@ -92,13 +101,17 @@ export class ChunkQueue<TInput extends ChunkQueueInput = ChunkQueueInput> {
   }
 
   private publishFailure(input: TInput, error: unknown): void {
-    this.events.publish({
-      type: "chunk-failed",
-      sessionId: input.sessionId,
-      chunkIndex: input.chunkIndex,
-      code: errorCode(error),
-      message: errorMessage(error)
-    });
+    try {
+      this.events.publish({
+        type: "chunk-failed",
+        sessionId: input.sessionId,
+        chunkIndex: input.chunkIndex,
+        code: errorCode(error),
+        message: errorMessage(error)
+      });
+    } catch {
+      // Event hubs should isolate subscriber failures, but queue promises must settle even if a publisher is replaced.
+    }
   }
 
   private hasPendingSessionWork(sessionId: string): boolean {
