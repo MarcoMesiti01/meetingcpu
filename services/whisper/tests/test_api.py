@@ -10,7 +10,15 @@ class FakeTranscriber:
             "text": "Hello from Python.",
             "language": language or "en",
             "durationSeconds": 1.2,
-            "segments": [{"start": 0, "end": 1.2, "text": "Hello from Python."}],
+            "segments": [
+                {
+                    "start": 0,
+                    "end": 1.2,
+                    "text": "Hello from Python.",
+                    "speaker": "Speaker 1",
+                }
+            ],
+            "diarization": {"available": True, "enabled": True},
         }
 
 
@@ -30,7 +38,7 @@ def test_importing_main_does_not_require_transcriber_or_faster_whisper(monkeypat
     original_import = builtins.__import__
 
     def reject_heavy_imports(name, *args, **kwargs):
-        if name in {"app.transcriber", "faster_whisper"}:
+        if name in {"app.transcriber", "faster_whisper", "pyannote.audio"}:
             raise AssertionError(f"{name} imported eagerly")
         return original_import(name, *args, **kwargs)
 
@@ -42,6 +50,7 @@ def test_importing_main_does_not_require_transcriber_or_faster_whisper(monkeypat
     assert main.create_app is not None
     assert "app.transcriber" not in sys.modules
     assert "faster_whisper" not in sys.modules
+    assert "pyannote.audio" not in sys.modules
 
 
 def test_health_endpoint():
@@ -58,7 +67,20 @@ def test_transcribe_endpoint_returns_transcript():
         json={"audioPath": "recording.webm", "modelId": "small", "language": None},
     )
     assert response.status_code == 200
-    assert response.json()["text"] == "Hello from Python."
+    assert response.json() == {
+        "text": "Hello from Python.",
+        "language": "en",
+        "durationSeconds": 1.2,
+        "segments": [
+            {
+                "start": 0,
+                "end": 1.2,
+                "text": "Hello from Python.",
+                "speaker": "Speaker 1",
+            }
+        ],
+        "diarization": {"available": True, "enabled": True},
+    }
 
 
 def test_transcribe_endpoint_rejects_unknown_model():

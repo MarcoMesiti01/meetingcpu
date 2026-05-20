@@ -19,6 +19,34 @@ class FakeInfo:
     duration = 1.0
 
 
+class FakeSegment:
+    def __init__(self, start, end, text):
+        self.start = start
+        self.end = end
+        self.text = text
+
+
+class GoodModel:
+    def transcribe(self, audio_path, language, vad_filter, beam_size):
+        return [FakeSegment(0, 1.0, " Hello ")], FakeInfo()
+
+
+class AvailableDiarizer:
+    def is_available(self):
+        return True
+
+    def diarize(self, audio_path):
+        return [{"start": 0, "end": 1.0, "speaker": "Speaker 1"}]
+
+
+class UnavailableDiarizer:
+    def is_available(self):
+        return False
+
+    def diarize(self, audio_path):
+        raise AssertionError("unavailable diarizer should not be used")
+
+
 def failing_segments():
     raise ValueError("bad segment")
     yield
@@ -48,3 +76,38 @@ def test_transcriber_wraps_segment_iteration_errors_as_audio_unreadable(tmp_path
 
     assert str(audio_path) in str(error.value)
     assert "bad segment" in str(error.value)
+
+
+def test_transcriber_returns_chunk_shape_with_fake_diarization(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(diarizer=AvailableDiarizer())
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert result == {
+        "text": "Hello",
+        "language": "en",
+        "durationSeconds": 1.0,
+        "segments": [
+            {"start": 0, "end": 1.0, "text": "Hello", "speaker": "Speaker 1"}
+        ],
+        "diarization": {"available": True, "enabled": True},
+    }
+
+
+def test_transcriber_returns_diarization_fallback_when_unavailable(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    transcriber = LocalTranscriber(diarizer=UnavailableDiarizer())
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert result["segments"] == [
+        {"start": 0, "end": 1.0, "text": "Hello", "speaker": "Speaker 1"}
+    ]
+    assert result["diarization"]["available"] is False
+    assert result["diarization"]["enabled"] is False
+    assert result["diarization"]["error"]
