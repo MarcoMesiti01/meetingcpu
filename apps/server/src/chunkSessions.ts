@@ -1,5 +1,6 @@
-import { appendFile, copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { dirname, extname, join } from "node:path";
 import type { ModelId } from "./models.js";
 import { createSession, type Session } from "./sessions.js";
 
@@ -50,6 +51,12 @@ interface ChunkFailure {
   message: string;
 }
 
+type ChunkStoredTranscriptResult = ChunkTranscriptResult & {
+  acceptedSegments?: ChunkTranscriptSegment[];
+};
+
+const sessionMutationChains = new Map<string, Promise<void>>();
+
 export async function createChunkSession(input: {
   dataRoot: string;
   now?: Date;
@@ -60,7 +67,7 @@ export async function createChunkSession(input: {
   const session = withChunkPaths(baseSession);
   await mkdir(session.chunksPath, { recursive: true });
   await mkdir(session.chunkResultsPath, { recursive: true });
-  await writeFile(session.manifestPath, "[]\n");
+  await writeManifest(session, []);
   await writeFile(session.inProgressTranscriptPath, "");
   await writeMetadata(session, {
     sessionId: session.id,
@@ -87,52 +94,62 @@ export async function saveChunkFile(input: {
   mimeType: string;
   originalName?: string;
 }): Promise<ChunkManifestEntry> {
-  await mkdir(input.session.chunksPath, { recursive: true });
-  const fileName = `${chunkStem(input.index)}${chunkExtension(input.originalName, input.mimeType)}`;
-  const destinationPath = join(input.session.chunksPath, fileName);
-  await moveFile(input.sourcePath, destinationPath);
-  const fileStat = await stat(destinationPath);
-  const entry: ChunkManifestEntry = {
-    index: input.index,
-    fileName,
-    path: destinationPath,
-    startSeconds: input.startSeconds,
-    endSeconds: input.endSeconds,
-    overlapSeconds: input.overlapSeconds,
-    mimeType: input.mimeType,
-    byteSize: fileStat.size,
-    status: "saved"
-  };
-  await upsertManifestEntry(input.session, entry);
-  await writeMetadata(input.session, {
-    status: "chunk-recording",
-    chunkCount: (await readManifest(input.session)).length,
-    updatedAt: new Date().toISOString()
+  return withSessionMutation(input.session, async () => {
+    await mkdir(input.session.chunksPath, { recursive: true });
+    const fileName = `${chunkStem(input.index)}${chunkExtension(input.originalName, input.mimeType)}`;
+    const destinationPath = join(input.session.chunksPath, fileName);
+    await moveFile(input.sourcePath, destinationPath);
+    const fileStat = await stat(destinationPath);
+    const entry: ChunkManifestEntry = {
+      index: input.index,
+      fileName,
+      path: destinationPath,
+      startSeconds: input.startSeconds,
+      endSeconds: input.endSeconds,
+      overlapSeconds: input.overlapSeconds,
+      mimeType: input.mimeType,
+      byteSize: fileStat.size,
+      status: "saved"
+    };
+    const manifest = upsertManifestEntry(await readManifest(input.session), entry);
+    await writeManifest(input.session, manifest);
+    await writeMetadata(input.session, {
+      status: "chunk-recording",
+      chunkCount: manifest.length,
+      updatedAt: new Date().toISOString()
+    });
+    return entry;
   });
-  return entry;
 }
 
 export async function saveChunkResult(input: { session: ChunkSession; result: ChunkTranscriptResult }): Promise<void> {
-  await mkdir(input.session.chunkResultsPath, { recursive: true });
-  await writeFile(resultPath(input.session, input.result.chunkIndex), JSON.stringify(input.result, null, 2));
-  await updateManifestStatus(input.session, input.result.chunkIndex, "transcribed");
+  await withSessionMutation(input.session, async () => {
+    await mkdir(input.session.chunkResultsPath, { recursive: true });
+    const manifest = await readManifest(input.session);
+    const manifestEntry = requireManifestEntry(manifest, input.result.chunkIndex);
+    const storedResult: ChunkStoredTranscriptResult = {
+      ...input.result,
+      segments: normalizeSegments(input.result.segments, manifestEntry),
+      acceptedSegments: []
+    };
+    const existingResults = (await readChunkResults(input.session)).filter(
+      (result) => result.chunkIndex !== input.result.chunkIndex
+    );
+    const acceptedResults = applyAcceptedSegments([...existingResults, storedResult]);
 
-  const metadata = await readMetadata(input.session);
-  const previousEnd = numberFromMetadata(metadata.lastCommittedEndSeconds);
-  const keptSegments = input.result.segments.filter((segment) => segment.end > previousEnd);
-  if (keptSegments.length > 0) {
-    await appendFile(input.session.inProgressTranscriptPath, keptSegments.map(formatTranscriptLine).join(""));
-  }
+    await Promise.all(
+      acceptedResults.map((result) => writeJsonAtomic(resultPath(input.session, result.chunkIndex), result))
+    );
+    await writeManifest(input.session, setManifestStatus(manifest, input.result.chunkIndex, "transcribed"));
+    await writeFile(input.session.inProgressTranscriptPath, transcriptText(acceptedSegments(acceptedResults), true));
 
-  const lastCommittedEndSeconds = keptSegments.reduce(
-    (lastEnd, segment) => Math.max(lastEnd, segment.end),
-    previousEnd
-  );
-  const status = readFailures(metadata).length > 0 ? "chunk-transcribing-partial" : "chunk-transcribing";
-  await writeMetadata(input.session, {
-    status,
-    lastCommittedEndSeconds,
-    updatedAt: new Date().toISOString()
+    const metadata = await readMetadata(input.session);
+    const status = readFailures(metadata).length > 0 ? "chunk-transcribing-partial" : "chunk-transcribing";
+    await writeMetadata(input.session, {
+      status,
+      lastCommittedEndSeconds: maxSegmentEnd(acceptedSegments(acceptedResults)),
+      updatedAt: new Date().toISOString()
+    });
   });
 }
 
@@ -142,50 +159,59 @@ export async function markChunkFailed(input: {
   code: string;
   message: string;
 }): Promise<void> {
-  await updateManifestStatus(input.session, input.chunkIndex, "failed");
-  const metadata = await readMetadata(input.session);
-  const failures = readFailures(metadata).filter((failure) => failure.chunkIndex !== input.chunkIndex);
-  failures.push({ chunkIndex: input.chunkIndex, code: input.code, message: input.message });
-  failures.sort((left, right) => left.chunkIndex - right.chunkIndex);
-  await writeMetadata(input.session, {
-    status: "chunk-transcribing-partial",
-    failedChunks: failures,
-    updatedAt: new Date().toISOString()
+  await withSessionMutation(input.session, async () => {
+    const manifest = await readManifest(input.session);
+    requireManifestEntry(manifest, input.chunkIndex);
+    await writeManifest(input.session, setManifestStatus(manifest, input.chunkIndex, "failed"));
+    const metadata = await readMetadata(input.session);
+    const failures = readFailures(metadata).filter((failure) => failure.chunkIndex !== input.chunkIndex);
+    failures.push({ chunkIndex: input.chunkIndex, code: input.code, message: input.message });
+    failures.sort((left, right) => left.chunkIndex - right.chunkIndex);
+    await writeMetadata(input.session, {
+      status: "chunk-transcribing-partial",
+      failedChunks: failures,
+      updatedAt: new Date().toISOString()
+    });
   });
 }
 
 export async function finalizeChunkSession(input: {
   session: ChunkSession;
 }): Promise<{ transcriptPath: string; transcriptJsonPath: string; partial: boolean }> {
-  const results = await readChunkResults(input.session);
-  const text = results.map((result) => result.text.trim()).filter(Boolean).join("\n");
-  const segments = results.flatMap((result) => result.segments).sort((left, right) => left.start - right.start);
-  const language = results.find((result) => result.language)?.language ?? "";
-  const durationSeconds = results.reduce((total, result) => total + result.durationSeconds, 0);
-  const metadata = await readMetadata(input.session);
-  const manifest = await readManifest(input.session);
-  const partial = readFailures(metadata).length > 0 || manifest.some((entry) => entry.status === "failed");
-  const transcript = {
-    text,
-    language,
-    durationSeconds,
-    segments,
-    diarization: aggregateDiarization(results),
-    chunks: results,
-    partial
-  };
-  const transcriptPath = join(input.session.path, "transcript.txt");
-  const transcriptJsonPath = join(input.session.path, "transcript.json");
-  await writeFile(transcriptPath, `${text}\n`);
-  await writeFile(transcriptJsonPath, JSON.stringify(transcript, null, 2));
-  await writeMetadata(input.session, {
-    status: partial ? "transcribed-partial" : "transcribed",
-    language,
-    durationSeconds,
-    partial,
-    updatedAt: new Date().toISOString()
+  return withSessionMutation(input.session, async () => {
+    const results = applyAcceptedSegments(await readChunkResults(input.session));
+    await Promise.all(
+      results.map((result) => writeJsonAtomic(resultPath(input.session, result.chunkIndex), result))
+    );
+    const segments = acceptedSegments(results);
+    const text = transcriptText(segments, false);
+    const language = results.find((result) => result.language)?.language ?? "";
+    const metadata = await readMetadata(input.session);
+    const manifest = await readManifest(input.session);
+    const durationSeconds = Math.max(maxSegmentEnd(segments), maxManifestEnd(manifest));
+    const partial = readFailures(metadata).length > 0 || manifest.some((entry) => entry.status === "failed");
+    const transcript = {
+      text,
+      language,
+      durationSeconds,
+      segments,
+      diarization: aggregateDiarization(results),
+      chunks: results,
+      partial
+    };
+    const transcriptPath = join(input.session.path, "transcript.txt");
+    const transcriptJsonPath = join(input.session.path, "transcript.json");
+    await writeFile(transcriptPath, `${text}\n`);
+    await writeJsonAtomic(transcriptJsonPath, transcript);
+    await writeMetadata(input.session, {
+      status: partial ? "transcribed-partial" : "transcribed",
+      language,
+      durationSeconds,
+      partial,
+      updatedAt: new Date().toISOString()
+    });
+    return { transcriptPath, transcriptJsonPath, partial };
   });
-  return { transcriptPath, transcriptJsonPath, partial };
 }
 
 function withChunkPaths(session: Session): ChunkSession {
@@ -219,7 +245,7 @@ function chunkExtension(originalName: string | undefined, mimeType: string): str
   return ".webm";
 }
 
-function aggregateDiarization(results: ChunkTranscriptResult[]): ChunkDiarizationStatus {
+function aggregateDiarization(results: ChunkStoredTranscriptResult[]): ChunkDiarizationStatus {
   const available = results.some((result) => result.diarization.available);
   const enabled = results.some((result) => result.diarization.enabled);
   const error = enabled ? undefined : results.find((result) => result.diarization.error)?.diarization.error;
@@ -230,23 +256,27 @@ function resultPath(session: ChunkSession, chunkIndex: number): string {
   return join(session.chunkResultsPath, `${chunkStem(chunkIndex)}.json`);
 }
 
-async function upsertManifestEntry(session: ChunkSession, entry: ChunkManifestEntry): Promise<void> {
-  const manifest = await readManifest(session);
+function upsertManifestEntry(manifest: ChunkManifestEntry[], entry: ChunkManifestEntry): ChunkManifestEntry[] {
   const next = manifest.filter((existingEntry) => existingEntry.index !== entry.index);
   next.push(entry);
-  await writeManifest(session, next);
+  return next;
 }
 
-async function updateManifestStatus(
-  session: ChunkSession,
+function setManifestStatus(
+  manifest: ChunkManifestEntry[],
   chunkIndex: number,
   status: ChunkManifestEntry["status"]
-): Promise<void> {
-  const manifest = await readManifest(session);
-  const next = manifest.map((entry) => (entry.index === chunkIndex ? { ...entry, status } : entry));
-  if (next.length !== manifest.length || next.some((entry, index) => entry.status !== manifest[index]?.status)) {
-    await writeManifest(session, next);
+): ChunkManifestEntry[] {
+  requireManifestEntry(manifest, chunkIndex);
+  return manifest.map((entry) => (entry.index === chunkIndex ? { ...entry, status } : entry));
+}
+
+function requireManifestEntry(manifest: ChunkManifestEntry[], chunkIndex: number): ChunkManifestEntry {
+  const entry = manifest.find((manifestEntry) => manifestEntry.index === chunkIndex);
+  if (!entry) {
+    throw new Error(`Missing manifest entry for chunk ${chunkIndex}`);
   }
+  return entry;
 }
 
 async function readManifest(session: ChunkSession): Promise<ChunkManifestEntry[]> {
@@ -262,19 +292,79 @@ async function readManifest(session: ChunkSession): Promise<ChunkManifestEntry[]
 
 async function writeManifest(session: ChunkSession, manifest: ChunkManifestEntry[]): Promise<void> {
   const sorted = [...manifest].sort((left, right) => left.index - right.index);
-  await writeFile(session.manifestPath, `${JSON.stringify(sorted, null, 2)}\n`);
+  await writeJsonAtomic(session.manifestPath, sorted);
 }
 
-async function readChunkResults(session: ChunkSession): Promise<ChunkTranscriptResult[]> {
+async function readChunkResults(session: ChunkSession): Promise<ChunkStoredTranscriptResult[]> {
   const fileNames = await readdir(session.chunkResultsPath);
   const results = await Promise.all(
     fileNames
       .filter((fileName) => /^chunk-\d{6}\.json$/.test(fileName))
       .map(async (fileName) => {
-        return JSON.parse(await readFile(join(session.chunkResultsPath, fileName), "utf8")) as ChunkTranscriptResult;
+        return JSON.parse(await readFile(join(session.chunkResultsPath, fileName), "utf8")) as ChunkStoredTranscriptResult;
       })
   );
   return results.sort((left, right) => left.chunkIndex - right.chunkIndex);
+}
+
+function normalizeSegments(
+  segments: ChunkTranscriptSegment[],
+  manifestEntry: ChunkManifestEntry
+): ChunkTranscriptSegment[] {
+  return segments
+    .map((segment) => {
+      if (segment.start >= manifestEntry.startSeconds || segment.end > manifestEntry.endSeconds) {
+        return segment;
+      }
+      return {
+        ...segment,
+        start: segment.start + manifestEntry.startSeconds,
+        end: segment.end + manifestEntry.startSeconds
+      };
+    })
+    .sort(compareSegments);
+}
+
+function applyAcceptedSegments(results: ChunkStoredTranscriptResult[]): ChunkStoredTranscriptResult[] {
+  let lastAcceptedEnd = 0;
+  return [...results]
+    .sort((left, right) => left.chunkIndex - right.chunkIndex)
+    .map((result) => {
+      const resultAcceptedSegments: ChunkTranscriptSegment[] = [];
+      for (const segment of [...result.segments].sort(compareSegments)) {
+        if (segment.end > lastAcceptedEnd) {
+          resultAcceptedSegments.push(segment);
+          lastAcceptedEnd = Math.max(lastAcceptedEnd, segment.end);
+        }
+      }
+      return { ...result, acceptedSegments: resultAcceptedSegments };
+    });
+}
+
+function acceptedSegments(results: ChunkStoredTranscriptResult[]): ChunkTranscriptSegment[] {
+  return results.flatMap((result) => result.acceptedSegments ?? []).sort(compareSegments);
+}
+
+function compareSegments(left: ChunkTranscriptSegment, right: ChunkTranscriptSegment): number {
+  return left.start - right.start || left.end - right.end;
+}
+
+function transcriptText(segments: ChunkTranscriptSegment[], withTimestamps: boolean): string {
+  if (withTimestamps) {
+    return segments.map(formatTranscriptLine).join("");
+  }
+  return segments
+    .map((segment) => segment.text.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function maxSegmentEnd(segments: ChunkTranscriptSegment[]): number {
+  return segments.reduce((maxEnd, segment) => Math.max(maxEnd, segment.end), 0);
+}
+
+function maxManifestEnd(manifest: ChunkManifestEntry[]): number {
+  return manifest.reduce((maxEnd, entry) => Math.max(maxEnd, entry.endSeconds), 0);
 }
 
 function formatTranscriptLine(segment: ChunkTranscriptSegment): string {
@@ -292,7 +382,7 @@ function formatTimestamp(seconds: number): string {
 
 async function writeMetadata(session: Session, metadata: Record<string, unknown>): Promise<void> {
   const existing = await readMetadata(session);
-  await writeFile(join(session.path, "metadata.json"), JSON.stringify({ ...existing, ...metadata }, null, 2));
+  await writeJsonAtomic(join(session.path, "metadata.json"), { ...existing, ...metadata });
 }
 
 async function readMetadata(session: Session): Promise<Record<string, unknown>> {
@@ -304,10 +394,6 @@ async function readMetadata(session: Session): Promise<Record<string, unknown>> 
     }
     throw error;
   }
-}
-
-function numberFromMetadata(value: unknown): number {
-  return typeof value === "number" ? value : 0;
 }
 
 function readFailures(metadata: Record<string, unknown>): ChunkFailure[] {
@@ -340,6 +426,33 @@ async function moveFile(sourcePath: string, destinationPath: string): Promise<vo
     }
     throw error;
   }
+}
+
+async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
+  const temporaryPath = join(dirname(path), `.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`);
+    await rename(temporaryPath, path);
+  } catch (error) {
+    await unlink(temporaryPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+function withSessionMutation<T>(session: ChunkSession, operation: () => Promise<T>): Promise<T> {
+  const key = session.path;
+  const previous = sessionMutationChains.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const tail = next.then(
+    () => undefined,
+    () => undefined
+  );
+  sessionMutationChains.set(key, tail);
+  return next.finally(() => {
+    if (sessionMutationChains.get(key) === tail) {
+      sessionMutationChains.delete(key);
+    }
+  });
 }
 
 function isNodeError(error: unknown): error is Error & { code?: string } {

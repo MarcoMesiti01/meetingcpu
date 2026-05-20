@@ -14,6 +14,27 @@ async function readJson(path: string): Promise<Record<string, unknown>> {
   return JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
 }
 
+async function saveManifestedChunk(input: {
+  root: string;
+  session: Awaited<ReturnType<typeof createChunkSession>>;
+  index: number;
+  startSeconds: number;
+  endSeconds: number;
+  overlapSeconds?: number;
+}): Promise<void> {
+  const sourcePath = join(input.root, `chunk-${input.index}.webm`);
+  await writeFile(sourcePath, `audio-${input.index}`);
+  await saveChunkFile({
+    session: input.session,
+    sourcePath,
+    index: input.index,
+    startSeconds: input.startSeconds,
+    endSeconds: input.endSeconds,
+    overlapSeconds: input.overlapSeconds ?? 0,
+    mimeType: "audio/webm"
+  });
+}
+
 describe("chunk session storage", () => {
   it("creates chunk folders, manifest, in-progress transcript, and metadata", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
@@ -115,6 +136,14 @@ describe("chunk session storage", () => {
       overlapSeconds: 0,
       mimeType: "audio/webm"
     });
+    await saveManifestedChunk({
+      root,
+      session,
+      index: 2,
+      startSeconds: 13,
+      endSeconds: 21,
+      overlapSeconds: 2
+    });
 
     await saveChunkResult({
       session,
@@ -150,6 +179,11 @@ describe("chunk session storage", () => {
     const resultPath = join(session.chunkResultsPath, "chunk-000001.json");
     const savedResult = JSON.parse(await readFile(resultPath, "utf8"));
     expect(savedResult.chunkIndex).toBe(1);
+    expect(savedResult.acceptedSegments).toEqual([
+      { start: 0, end: 4, text: "Old overlap.", speaker: "Speaker 1" },
+      { start: 5, end: 8, text: "Hello there.", speaker: "Speaker 1" },
+      { start: 12, end: 14, text: "No speaker." }
+    ]);
 
     await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
       "[00:00:00] Speaker 1: Old overlap.\n" +
@@ -165,9 +199,11 @@ describe("chunk session storage", () => {
     });
   });
 
-  it("finalizes a chunk session from saved chunk results", async () => {
+  it("finalizes a chunk session from saved chunk results completed out of order", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 4 });
+    await saveManifestedChunk({ root, session, index: 2, startSeconds: 4, endSeconds: 8 });
 
     await saveChunkResult({
       session,
@@ -192,6 +228,10 @@ describe("chunk session storage", () => {
       }
     });
 
+    await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:00] First chunk.\n[00:00:04] Second chunk.\n"
+    );
+
     const finalized = await finalizeChunkSession({ session });
 
     expect(finalized).toEqual({
@@ -215,6 +255,161 @@ describe("chunk session storage", () => {
     ]);
   });
 
+  it("normalizes chunk-relative timestamps before saving accepted segments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({
+      root,
+      session,
+      index: 1,
+      startSeconds: 20,
+      endSeconds: 30,
+      overlapSeconds: 2
+    });
+
+    await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 1,
+        text: "Chunk relative.",
+        language: "en",
+        durationSeconds: 10,
+        diarization: { available: true, enabled: true },
+        segments: [{ start: 1, end: 3, text: "Chunk relative.", speaker: "Speaker 1" }]
+      }
+    });
+
+    const savedResult = JSON.parse(await readFile(join(session.chunkResultsPath, "chunk-000001.json"), "utf8"));
+    expect(savedResult.segments).toEqual([{ start: 21, end: 23, text: "Chunk relative.", speaker: "Speaker 1" }]);
+    expect(savedResult.acceptedSegments).toEqual([
+      { start: 21, end: 23, text: "Chunk relative.", speaker: "Speaker 1" }
+    ]);
+    await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:21] Speaker 1: Chunk relative.\n"
+    );
+  });
+
+  it("finalizes transcript text and duration from accepted de-duplicated segments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 10 });
+    await saveManifestedChunk({ root, session, index: 2, startSeconds: 8, endSeconds: 18, overlapSeconds: 2 });
+
+    await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 1,
+        text: "Intro.\nShared overlap.",
+        language: "en",
+        durationSeconds: 10,
+        diarization: { available: false, enabled: false },
+        segments: [
+          { start: 0, end: 6, text: "Intro." },
+          { start: 7, end: 10, text: "Shared overlap." }
+        ]
+      }
+    });
+    await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 2,
+        text: "Shared overlap.\nFresh ending.",
+        language: "en",
+        durationSeconds: 10,
+        diarization: { available: false, enabled: false },
+        segments: [
+          { start: 0, end: 2, text: "Shared overlap." },
+          { start: 3, end: 8, text: "Fresh ending." }
+        ]
+      }
+    });
+
+    const finalized = await finalizeChunkSession({ session });
+
+    await expect(readFile(finalized.transcriptPath, "utf8")).resolves.toBe("Intro.\nShared overlap.\nFresh ending.\n");
+    const transcriptJson = JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"));
+    expect(transcriptJson.text).toBe("Intro.\nShared overlap.\nFresh ending.");
+    expect(transcriptJson.durationSeconds).toBe(18);
+    expect(transcriptJson.segments).toEqual([
+      { start: 0, end: 6, text: "Intro." },
+      { start: 7, end: 10, text: "Shared overlap." },
+      { start: 11, end: 16, text: "Fresh ending." }
+    ]);
+  });
+
+  it("rejects chunk results and failures when the manifest entry is missing", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+
+    await expect(
+      saveChunkResult({
+        session,
+        result: {
+          chunkIndex: 1,
+          text: "Missing manifest.",
+          language: "en",
+          durationSeconds: 3,
+          diarization: { available: false, enabled: false },
+          segments: [{ start: 0, end: 3, text: "Missing manifest." }]
+        }
+      })
+    ).rejects.toThrow("Missing manifest entry for chunk 1");
+
+    await expect(
+      markChunkFailed({
+        session,
+        chunkIndex: 1,
+        code: "TRANSCRIBE_FAILED",
+        message: "Unable to transcribe chunk."
+      })
+    ).rejects.toThrow("Missing manifest entry for chunk 1");
+  });
+
+  it("serializes concurrent chunk result saves without losing manifest or transcript updates", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    for (let index = 1; index <= 6; index += 1) {
+      await saveManifestedChunk({ root, session, index, startSeconds: index - 1, endSeconds: index });
+    }
+
+    await Promise.all(
+      Array.from({ length: 6 }, async (_, offset) => {
+        const index = offset + 1;
+        await saveChunkResult({
+          session,
+          result: {
+            chunkIndex: index,
+            text: `Line ${index}.`,
+            language: "en",
+            durationSeconds: 1,
+            diarization: { available: false, enabled: false },
+            segments: [{ start: 0, end: 1, text: `Line ${index}.` }]
+          }
+        });
+      })
+    );
+
+    const manifest = JSON.parse(await readFile(session.manifestPath, "utf8"));
+    expect(manifest.map((entry: { status: string }) => entry.status)).toEqual([
+      "transcribed",
+      "transcribed",
+      "transcribed",
+      "transcribed",
+      "transcribed",
+      "transcribed"
+    ]);
+    const metadata = await readJson(join(session.path, "metadata.json"));
+    expect(metadata.lastCommittedEndSeconds).toBe(6);
+    await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:00] Line 1.\n" +
+        "[00:00:01] Line 2.\n" +
+        "[00:00:02] Line 3.\n" +
+        "[00:00:03] Line 4.\n" +
+        "[00:00:04] Line 5.\n" +
+        "[00:00:05] Line 6.\n"
+    );
+  });
+
   it("marks failed chunks in metadata without deleting prior transcript text", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });
@@ -229,6 +424,7 @@ describe("chunk session storage", () => {
       overlapSeconds: 0,
       mimeType: "audio/webm"
     });
+    await saveManifestedChunk({ root, session, index: 2, startSeconds: 10, endSeconds: 20 });
     await saveChunkResult({
       session,
       result: {
