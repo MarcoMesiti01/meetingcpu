@@ -75,6 +75,7 @@ export interface RouteDependencies {
   chunkQueue?: ChunkQueue<RouteChunkQueueInput>;
   chunkSessionStore?: Map<string, RouteChunkSessionState>;
   saveChunkFile?: typeof saveChunkFile;
+  cleanupUploadedFile?: typeof cleanupUploadedFile;
 }
 
 const MAX_AUDIO_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -89,6 +90,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
   const events = dependencies.events ?? new SessionEventHub();
   const chunkSessionStore = dependencies.chunkSessionStore ?? new Map<string, RouteChunkSessionState>();
   const saveUploadedChunk = dependencies.saveChunkFile ?? saveChunkFile;
+  const cleanupUpload = dependencies.cleanupUploadedFile ?? cleanupUploadedFile;
   const chunkQueue =
     dependencies.chunkQueue ??
     new ChunkQueue<RouteChunkQueueInput>({
@@ -203,13 +205,13 @@ export function createRoutes(dependencies: RouteDependencies): Router {
   router.post("/sessions/:id/chunks", upload.single("audio"), asyncHandler(async (request, response) => {
     const state = chunkSessionStore.get(request.params.id);
     if (!state) {
-      await cleanupUploadedFile(request.file);
+      await cleanupUpload(request.file);
       response.status(404).json({ code: "SESSION_NOT_FOUND", message: "Session was not found." });
       return;
     }
 
     if (state.status !== "recording") {
-      await cleanupUploadedFile(request.file);
+      await cleanupUpload(request.file);
       response.status(state.status === "finalized" ? 410 : 409).json(sessionClosedBody(state.status));
       return;
     }
@@ -221,82 +223,78 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
     const chunkFields = parseChunkFields(request);
     if (!chunkFields.ok) {
-      await cleanupUploadedFile(request.file);
+      await cleanupUpload(request.file);
       response.status(400).json(chunkFields.error);
       return;
     }
 
     const acceptedUpload = beginChunkUpload(state);
     if (!acceptedUpload.ok) {
-      await cleanupUploadedFile(request.file);
+      await cleanupUpload(request.file);
       response.status(acceptedUpload.statusCode).json(acceptedUpload.body);
       return;
     }
 
-    let isDuplicateChunk: boolean;
+    let releaseAcceptedUpload = true;
     try {
-      isDuplicateChunk = await chunkIndexExists(state.session, chunkFields.value.chunkIndex);
-    } catch (error) {
-      endChunkUpload(state);
-      throw error;
-    }
-
-    if (isDuplicateChunk) {
-      await cleanupUploadedFile(request.file);
-      endChunkUpload(state);
-      response.status(409).json({
-        code: "DUPLICATE_CHUNK_INDEX",
-        message: `Chunk index ${chunkFields.value.chunkIndex} has already been uploaded.`
-      });
-      return;
-    }
-
-    let saved: Awaited<ReturnType<typeof saveChunkFile>> | null = null;
-    try {
-      saved = await saveUploadedChunk({
-        session: state.session,
-        sourcePath: request.file.path,
-        index: chunkFields.value.chunkIndex,
-        startSeconds: chunkFields.value.startSeconds,
-        endSeconds: chunkFields.value.endSeconds,
-        overlapSeconds: chunkFields.value.overlapSeconds,
-        mimeType: request.file.mimetype || String(request.body.mimeType ?? "audio/webm"),
-        originalName: request.file.originalname
-      });
-    } catch {
-      endChunkUpload(state);
-      await cleanupUploadedFile(request.file);
-      response.status(500).json({
-        code: "CHUNK_UPLOAD_FAILED",
-        message: "Chunk could not be saved for transcription."
-      });
-      return;
-    } finally {
-      if (!saved) {
-        await cleanupUploadedFile(request.file);
-      }
-    }
-
-    try {
-      events.publish({ type: "chunk-saved", sessionId: state.session.id, chunkIndex: saved.index });
-      const enqueuePromise = chunkQueue.enqueue({
-        sessionId: state.session.id,
-        chunkIndex: saved.index,
-        session: state.session,
-        chunkPath: saved.path,
-        modelId: state.modelId,
-        language: state.language,
-        diarization: state.diarization
-      });
-      void trackChunkQueueCompletion({
-        state,
-        chunkIndex: saved.index,
-        enqueuePromise,
-        events
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Chunk queue failed.";
+      let isDuplicateChunk: boolean;
       try {
+        isDuplicateChunk = await chunkIndexExists(state.session, chunkFields.value.chunkIndex);
+      } catch (error) {
+        await cleanupUpload(request.file);
+        throw error;
+      }
+
+      if (isDuplicateChunk) {
+        await cleanupUpload(request.file);
+        response.status(409).json({
+          code: "DUPLICATE_CHUNK_INDEX",
+          message: `Chunk index ${chunkFields.value.chunkIndex} has already been uploaded.`
+        });
+        return;
+      }
+
+      let saved: Awaited<ReturnType<typeof saveChunkFile>>;
+      try {
+        saved = await saveUploadedChunk({
+          session: state.session,
+          sourcePath: request.file.path,
+          index: chunkFields.value.chunkIndex,
+          startSeconds: chunkFields.value.startSeconds,
+          endSeconds: chunkFields.value.endSeconds,
+          overlapSeconds: chunkFields.value.overlapSeconds,
+          mimeType: request.file.mimetype || String(request.body.mimeType ?? "audio/webm"),
+          originalName: request.file.originalname
+        });
+      } catch {
+        await cleanupUpload(request.file);
+        response.status(500).json({
+          code: "CHUNK_UPLOAD_FAILED",
+          message: "Chunk could not be saved for transcription."
+        });
+        return;
+      }
+
+      try {
+        events.publish({ type: "chunk-saved", sessionId: state.session.id, chunkIndex: saved.index });
+        const enqueuePromise = chunkQueue.enqueue({
+          sessionId: state.session.id,
+          chunkIndex: saved.index,
+          session: state.session,
+          chunkPath: saved.path,
+          modelId: state.modelId,
+          language: state.language,
+          diarization: state.diarization
+        });
+        releaseAcceptedUpload = false;
+        void trackChunkQueueCompletion({
+          state,
+          chunkIndex: saved.index,
+          enqueuePromise,
+          events
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Chunk queue failed.";
         await markChunkFailed({
           session: state.session,
           chunkIndex: saved.index,
@@ -314,17 +312,19 @@ export function createRoutes(dependencies: RouteDependencies): Router {
           code: "CHUNK_UPLOAD_FAILED",
           message: "Chunk could not be queued for transcription."
         });
-      } finally {
+        return;
+      }
+
+      response.status(202).json({
+        sessionId: state.session.id,
+        chunkIndex: saved.index,
+        status: "queued"
+      });
+    } finally {
+      if (releaseAcceptedUpload) {
         endChunkUpload(state);
       }
-      return;
     }
-
-    response.status(202).json({
-      sessionId: state.session.id,
-      chunkIndex: saved.index,
-      status: "queued"
-    });
   }));
 
   router.post("/sessions/:id/finalize", asyncHandler(async (request, response) => {

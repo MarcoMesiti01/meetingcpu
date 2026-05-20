@@ -6,6 +6,7 @@ import { join } from "node:path";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createApp } from "./app.js";
+import type { RouteChunkSessionState } from "./routes.js";
 import { SessionEventHub } from "./sessionEvents.js";
 
 describe("server routes", () => {
@@ -326,6 +327,56 @@ describe("server routes", () => {
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
+  it("ends accepted chunk uploads when duplicate cleanup fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkSessionStore = new Map<string, RouteChunkSessionState>();
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue,
+      chunkSessionStore,
+      cleanupUploadedFile: vi.fn(async () => {
+        throw new Error("cleanup failed");
+      })
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Duplicate cleanup", modelId: "small" }).expect(201);
+
+    await uploadChunk(app, created.body.sessionId, 1, "first").expect(202);
+    await uploadChunk(app, created.body.sessionId, 1, "second").expect(500);
+
+    const state = chunkSessionStore.get(created.body.sessionId);
+    expect(state?.activeChunkUploads).toBe(0);
+    expect(state?.chunkUploadWaiters).toEqual([]);
+  });
+
+  it("cleans temp uploads and ends accepted chunk uploads when duplicate detection fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkSessionStore = new Map<string, RouteChunkSessionState>();
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue,
+      chunkSessionStore
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Manifest failure", modelId: "small" }).expect(201);
+    await writeFile(join(dataRoot, "sessions", created.body.sessionId, "recording.manifest.json"), "{not-json");
+
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(500);
+
+    const state = chunkSessionStore.get(created.body.sessionId);
+    expect(state?.activeChunkUploads).toBe(0);
+    expect(state?.chunkUploadWaiters).toEqual([]);
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
   it("returns a controlled error and cleans temp uploads when enqueue fails synchronously", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const chunkQueue = {
@@ -392,6 +443,7 @@ describe("server routes", () => {
 
   it("finalize waits for an accepted chunk upload to finish enqueue registration", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkSessionStore = new Map<string, RouteChunkSessionState>();
     let releaseSave!: () => void;
     let saveStarted!: () => void;
     const saveStartedPromise = new Promise<void>((resolve) => {
@@ -405,6 +457,7 @@ describe("server routes", () => {
       dataRoot,
       transcriptionClient: fakeTranscriptionClient(),
       chunkQueue,
+      chunkSessionStore,
       saveChunkFile: vi.fn(async ({ session, sourcePath, index, startSeconds, endSeconds }) => {
         saveStarted();
         await new Promise<void>((resolve) => {
@@ -432,7 +485,9 @@ describe("server routes", () => {
       .expect(200)
       .then((response) => response);
 
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await vi.waitFor(() => {
+      expect(chunkSessionStore.get(created.body.sessionId)?.status).toBe("finalizing");
+    });
     expect(chunkQueue.waitForSession).not.toHaveBeenCalled();
 
     releaseSave();
