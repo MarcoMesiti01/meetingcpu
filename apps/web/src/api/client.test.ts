@@ -231,6 +231,29 @@ describe("api client", () => {
     expect(onError).toHaveBeenCalledWith(expect.any(Error));
     expect(onError).toHaveBeenCalledWith(new Error("Session event stream failed."));
   });
+
+  it("does not report onEvent exceptions as session event parse failures", () => {
+    const EventSourceCtor = createFakeEventSource();
+    const client = createApiClient(vi.fn(), EventSourceCtor);
+    const onError = vi.fn();
+    const handlerError = new Error("handler failed");
+
+    client.subscribeToSessionEvents("session-1", {
+      onEvent: () => {
+        throw handlerError;
+      },
+      onError
+    });
+
+    expect(() => {
+      EventSourceCtor.instances[0].emit("chunk-saved", {
+        type: "chunk-saved",
+        sessionId: "session-1",
+        chunkIndex: 1
+      });
+    }).toThrow(handlerError);
+    expect(onError).not.toHaveBeenCalledWith(new Error("Could not parse session event."));
+  });
 });
 
 function createInput() {

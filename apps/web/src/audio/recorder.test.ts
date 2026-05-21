@@ -149,16 +149,19 @@ describe("BrowserAudioRecorder", () => {
     expect(blob.type).toBe("audio/webm");
   });
 
-  it("starts chunked recording with a timeslice and emits chunk metadata", async () => {
+  it("starts chunked recording with a timeslice and emits clock-based chunk metadata", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, mimeType: "audio/webm;codecs=opus" });
-    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    let now = 1_000;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const chunks: unknown[] = [];
 
     await recorder.startChunked({ chunkSeconds: 2, onChunk: (chunk) => chunks.push(chunk) });
     const instance = recorderCtor.instances[0];
+    now = 2_250;
     instance.emitAudio("first");
+    now = 4_750;
     instance.emitAudio("second");
 
     expect(instance.startCalls).toEqual([2000]);
@@ -168,15 +171,15 @@ describe("BrowserAudioRecorder", () => {
       {
         chunkIndex: 1,
         startSeconds: 0,
-        endSeconds: 2,
+        endSeconds: 1.25,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000001.webm"
       },
       {
         chunkIndex: 2,
-        startSeconds: 2,
-        endSeconds: 4,
+        startSeconds: 1.25,
+        endSeconds: 3.75,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000002.webm"
@@ -213,6 +216,45 @@ describe("BrowserAudioRecorder", () => {
     expect(blob.type).toBe("audio/webm");
   });
 
+  it("waits for pending chunk callbacks and the final stop chunk before resolving stop", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({
+      emitDataOnStart: false,
+      emitDataOnStop: true
+    });
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const firstChunk = createDeferred<void>();
+    const finalChunk = createDeferred<void>();
+    const onChunk = vi.fn()
+      .mockReturnValueOnce(firstChunk.promise)
+      .mockReturnValueOnce(finalChunk.promise);
+
+    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    recorderCtor.instances[0].emitAudio("first");
+
+    const stopPromise = recorder.stop();
+    let stopResolved = false;
+    stopPromise.then(() => {
+      stopResolved = true;
+    });
+    await Promise.resolve();
+
+    expect(onChunk).toHaveBeenCalledTimes(2);
+    expect(stopResolved).toBe(false);
+
+    firstChunk.resolve();
+    await Promise.resolve();
+    expect(stopResolved).toBe(false);
+
+    finalChunk.resolve();
+    const blob = await stopPromise;
+
+    expect(stopResolved).toBe(true);
+    expect(await readBlobAsText(blob)).toBe("firstaudio");
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+  });
+
   it("does not emit empty chunks during chunked recording", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
@@ -243,22 +285,21 @@ describe("BrowserAudioRecorder", () => {
     await recorder.stop();
   });
 
-  it("cleans up tracks when chunk callbacks fail", async () => {
+  it("cleans up tracks and rejects stop with the chunk callback error when callbacks fail", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const uploadError = new Error("upload failed");
 
     await recorder.startChunked({
       chunkSeconds: 2,
-      onChunk: () => {
-        throw new Error("upload failed");
-      }
+      onChunk: () => Promise.reject(uploadError)
     });
     recorderCtor.instances[0].emitAudio("audio");
 
+    await expect(recorder.stop()).rejects.toThrow("upload failed");
     expect(stream.stop).toHaveBeenCalledTimes(1);
-    await expect(recorder.stop()).rejects.toThrow("Recording has not started.");
   });
 });
 

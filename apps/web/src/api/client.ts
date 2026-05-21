@@ -166,11 +166,14 @@ export function createApiClient(fetchImpl: typeof fetch = fetch, EventSourceCtor
       const eventSource = new SourceCtor(`/api/sessions/${encodeURIComponent(sessionId)}/events`);
       for (const eventType of SESSION_EVENT_TYPES) {
         eventSource.addEventListener(eventType, (event) => {
+          let parsedEvent: SessionEvent;
           try {
-            handlers.onEvent(JSON.parse(event.data) as SessionEvent);
+            parsedEvent = JSON.parse(event.data) as SessionEvent;
           } catch {
             handlers.onError?.(new Error("Could not parse session event."));
+            return;
           }
+          handlers.onEvent(parsedEvent);
         });
       }
       eventSource.onerror = () => {

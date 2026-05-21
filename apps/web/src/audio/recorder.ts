@@ -25,10 +25,15 @@ export class BrowserAudioRecorder {
   private startInProgress = false;
   private chunkOptions: Required<StartChunkedRecordingOptions> | null = null;
   private nextChunkIndex = 1;
+  private pendingChunkCallbacks = new Set<Promise<void>>();
+  private chunkCallbackError: unknown = null;
+  private chunkRecordingStartedAtMs = 0;
+  private lastChunkEndSeconds = 0;
 
   constructor(
     private readonly getUserMedia: GetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
-    private readonly MediaRecorderCtor: typeof MediaRecorder = MediaRecorder
+    private readonly MediaRecorderCtor: typeof MediaRecorder = MediaRecorder,
+    private readonly now: () => number = () => globalThis.performance?.now() ?? Date.now()
   ) {}
 
   async start(): Promise<void> {
@@ -44,6 +49,10 @@ export class BrowserAudioRecorder {
       this.chunks = [];
       this.chunkOptions = null;
       this.nextChunkIndex = 1;
+      this.pendingChunkCallbacks.clear();
+      this.chunkCallbackError = null;
+      this.chunkRecordingStartedAtMs = 0;
+      this.lastChunkEndSeconds = 0;
 
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
@@ -75,6 +84,9 @@ export class BrowserAudioRecorder {
       this.stream = stream;
       this.chunks = [];
       this.nextChunkIndex = 1;
+      this.pendingChunkCallbacks.clear();
+      this.chunkCallbackError = null;
+      this.lastChunkEndSeconds = 0;
       this.chunkOptions = {
         chunkSeconds: options.chunkSeconds ?? DEFAULT_CHUNK_SECONDS,
         onChunk: options.onChunk
@@ -83,8 +95,9 @@ export class BrowserAudioRecorder {
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
       mediaRecorder.ondataavailable = (event) => {
-        void this.handleChunkedData(event.data).catch(() => undefined);
+        this.trackChunkedData(event.data);
       };
+      this.chunkRecordingStartedAtMs = this.now();
       mediaRecorder.start(this.chunkOptions.chunkSeconds * 1000);
     } catch (error) {
       this.reset();
@@ -96,16 +109,32 @@ export class BrowserAudioRecorder {
 
   async stop(): Promise<Blob> {
     if (!this.mediaRecorder) {
+      if (this.chunkCallbackError) {
+        const error = this.chunkCallbackError;
+        this.reset();
+        throw normalizeError(error);
+      }
       throw new Error("Recording has not started.");
     }
 
     const recorder = this.mediaRecorder;
     return new Promise((resolve, reject) => {
       recorder.onstop = () => {
-        const chunks = this.chunks;
-        const type = chunks[0]?.type || DEFAULT_MIME_TYPE;
-        this.reset();
-        resolve(new Blob(chunks, { type }));
+        void (async () => {
+          try {
+            await this.waitForPendingChunkCallbacks();
+            if (this.chunkCallbackError) {
+              throw this.chunkCallbackError;
+            }
+            const chunks = this.chunks;
+            const type = chunks[0]?.type || DEFAULT_MIME_TYPE;
+            this.reset();
+            resolve(new Blob(chunks, { type }));
+          } catch (error) {
+            this.reset();
+            reject(normalizeError(error));
+          }
+        })();
       };
       try {
         recorder.stop();
@@ -114,6 +143,26 @@ export class BrowserAudioRecorder {
         reject(error);
       }
     });
+  }
+
+  private trackChunkedData(blob: Blob) {
+    const pending = this.handleChunkedData(blob).catch((error) => {
+      this.chunkCallbackError = this.chunkCallbackError ?? error;
+      this.cleanupMedia();
+      throw error;
+    });
+    this.pendingChunkCallbacks.add(pending);
+    pending.then(
+      () => this.pendingChunkCallbacks.delete(pending),
+      () => this.pendingChunkCallbacks.delete(pending)
+    );
+    pending.catch(() => undefined);
+  }
+
+  private async waitForPendingChunkCallbacks() {
+    while (this.pendingChunkCallbacks.size > 0) {
+      await Promise.all([...this.pendingChunkCallbacks]);
+    }
   }
 
   private async handleChunkedData(blob: Blob) {
@@ -125,27 +174,25 @@ export class BrowserAudioRecorder {
     this.nextChunkIndex += 1;
     this.chunks.push(blob);
 
-    const startSeconds = (chunkIndex - 1) * this.chunkOptions.chunkSeconds;
-    const endSeconds = chunkIndex * this.chunkOptions.chunkSeconds;
+    const elapsedSeconds = Math.max(0, (this.now() - this.chunkRecordingStartedAtMs) / 1000);
+    const startSeconds = this.lastChunkEndSeconds;
+    const endSeconds = Math.max(startSeconds, elapsedSeconds);
+    this.lastChunkEndSeconds = endSeconds;
     const mimeType = blob.type || DEFAULT_MIME_TYPE;
     const fileExtension = extensionForMimeType(mimeType);
 
-    try {
-      await this.chunkOptions.onChunk({
-        chunkIndex,
-        startSeconds,
-        endSeconds,
-        blob,
-        mimeType,
-        fileExtension,
-        fileName: `chunk-${chunkIndex.toString().padStart(6, "0")}.${fileExtension}`
-      });
-    } catch (error) {
-      this.reset();
-    }
+    await this.chunkOptions.onChunk({
+      chunkIndex,
+      startSeconds,
+      endSeconds,
+      blob,
+      mimeType,
+      fileExtension,
+      fileName: `chunk-${chunkIndex.toString().padStart(6, "0")}.${fileExtension}`
+    });
   }
 
-  private reset() {
+  private cleanupMedia() {
     if (this.mediaRecorder) {
       this.mediaRecorder.ondataavailable = null;
       this.mediaRecorder.onstop = null;
@@ -153,10 +200,23 @@ export class BrowserAudioRecorder {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.mediaRecorder = null;
     this.stream = null;
+    this.chunkOptions = null;
+  }
+
+  private reset() {
+    this.cleanupMedia();
     this.chunks = [];
     this.chunkOptions = null;
     this.nextChunkIndex = 1;
+    this.pendingChunkCallbacks.clear();
+    this.chunkCallbackError = null;
+    this.chunkRecordingStartedAtMs = 0;
+    this.lastChunkEndSeconds = 0;
   }
+}
+
+function normalizeError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 function extensionForMimeType(mimeType: string): string {
