@@ -162,6 +162,8 @@ describe("BrowserAudioRecorder", () => {
     instance.emitAudio("second");
 
     expect(instance.startCalls).toEqual([2000]);
+    expect(chunks[0]).toHaveProperty("blob");
+    expect(await readBlobAsText((chunks[0] as { blob: Blob }).blob)).toBe("first");
     expect(chunks).toMatchObject([
       {
         chunkIndex: 1,
@@ -181,6 +183,18 @@ describe("BrowserAudioRecorder", () => {
       }
     ]);
 
+    await recorder.stop();
+  });
+
+  it("uses a 30 second timeslice by default for chunked recording", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+
+    await recorder.startChunked({ onChunk: vi.fn() });
+
+    expect(recorderCtor.instances[0].startCalls).toEqual([30_000]);
     await recorder.stop();
   });
 
