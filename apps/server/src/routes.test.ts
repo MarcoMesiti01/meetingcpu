@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -686,7 +686,10 @@ describe("server routes", () => {
     const transcriptionClient = fakeTranscriptionClient();
     const app = createApp({
       dataRoot,
-      transcriptionClient
+      transcriptionClient,
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue(null)
+      }
     });
 
     const response = await request(app)
@@ -701,6 +704,56 @@ describe("server routes", () => {
       message: "Upload chunking requires ffmpeg. Install ffmpeg or set FFMPEG_PATH."
     });
     expect(transcriptionClient.transcribe).not.toHaveBeenCalled();
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    await expect(access(join(dataRoot, "sessions"))).rejects.toThrow();
+  });
+
+  it("chunks uploaded audio locally and finalizes it through the queue", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn(async ({ audioPath }: { audioPath: string }) => {
+      const text = (await readFile(audioPath, "utf8")).trim();
+      return {
+        text,
+        language: "en",
+        durationSeconds: 1,
+        segments: [{ start: 0, end: 1, text }],
+        diarization: { available: true, enabled: true }
+      };
+    });
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPaths = [join(outputDirectory, "chunk-000000.webm"), join(outputDirectory, "chunk-000001.webm")];
+      await writeFile(chunkPaths[0], "Hello");
+      await writeFile(chunkPaths[1], "world");
+      return chunkPaths;
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe },
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Upload")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(201);
+
+    expect(splitAudioIntoChunks).toHaveBeenCalled();
+    expect(transcribe).toHaveBeenCalledTimes(2);
+    expect(response.body.sessionId).toContain("upload");
+    expect(response.body.sessionPath).toBe(join(dataRoot, "sessions", response.body.sessionId));
+    expect(response.body.transcript.text).toBe("Hello\nworld");
+    expect(response.body.transcriptPath).toBe(join(response.body.sessionPath, "transcript.txt"));
+    expect(response.body.transcriptJsonPath).toBe(join(response.body.sessionPath, "transcript.json"));
+    await expect(readFile(response.body.transcriptPath, "utf8")).resolves.toBe("Hello\nworld\n");
+    await expect(readFile(response.body.transcriptJsonPath, "utf8")).resolves.toContain('"text": "Hello\\nworld"');
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
   it("returns a controlled error when uploads exceed the size limit", async () => {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, rm, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { extname, join } from "node:path";
 import { Router, type NextFunction, type Request, type RequestHandler, type Response } from "express";
@@ -15,6 +15,7 @@ import {
   type ChunkTranscriptResult,
   type ChunkTranscriptSegment
 } from "./chunkSessions.js";
+import { resolveFfmpegPath, splitAudioIntoChunks } from "./ffmpegChunks.js";
 import { DEFAULT_MODEL_ID, listModelOptions, parseModelId, type ModelId } from "./models.js";
 import { SessionEventHub } from "./sessionEvents.js";
 import {
@@ -77,6 +78,10 @@ export interface RouteDependencies {
   chunkSessionStore?: Map<string, RouteChunkSessionState>;
   saveChunkFile?: typeof saveChunkFile;
   cleanupUploadedFile?: typeof cleanupUploadedFile;
+  ffmpegChunks?: {
+    resolveFfmpegPath?: typeof resolveFfmpegPath;
+    splitAudioIntoChunks?: typeof splitAudioIntoChunks;
+  };
 }
 
 const MAX_AUDIO_UPLOAD_BYTES = 500 * 1024 * 1024;
@@ -92,6 +97,8 @@ export function createRoutes(dependencies: RouteDependencies): Router {
   const chunkSessionStore = dependencies.chunkSessionStore ?? new Map<string, RouteChunkSessionState>();
   const saveUploadedChunk = dependencies.saveChunkFile ?? saveChunkFile;
   const cleanupUpload = dependencies.cleanupUploadedFile ?? cleanupUploadedFile;
+  const resolveUploadFfmpegPath = dependencies.ffmpegChunks?.resolveFfmpegPath ?? resolveFfmpegPath;
+  const splitUploadAudio = dependencies.ffmpegChunks?.splitAudioIntoChunks ?? splitAudioIntoChunks;
   const chunkQueue =
     dependencies.chunkQueue ??
     new ChunkQueue<RouteChunkQueueInput>({
@@ -380,8 +387,20 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
     const sourceType = parseSourceType(request.body.sourceType);
     if (sourceType === "upload") {
-      await cleanupUploadedFile(request.file);
-      response.status(501).json(UPLOAD_CHUNKING_UNAVAILABLE);
+      await handleUploadTranscription({
+        request,
+        response,
+        dataRoot: dependencies.dataRoot,
+        modelId: modelResult.value,
+        title: String(request.body.title ?? "local meeting"),
+        language: request.body.language ? String(request.body.language) : null,
+        diarization: parseBoolean(request.body.diarization),
+        cleanupUpload,
+        resolveUploadFfmpegPath,
+        splitUploadAudio,
+        chunkQueue,
+        events
+      });
       return;
     }
 
@@ -461,6 +480,104 @@ async function cleanupUploadedFile(file: Express.Multer.File | undefined): Promi
     if (!isNodeError(error) || error.code !== "ENOENT") {
       throw error;
     }
+  }
+}
+
+async function handleUploadTranscription(input: {
+  request: Request;
+  response: Response;
+  dataRoot: string;
+  modelId: ModelId;
+  title: string;
+  language: string | null;
+  diarization: boolean;
+  cleanupUpload: typeof cleanupUploadedFile;
+  resolveUploadFfmpegPath: typeof resolveFfmpegPath;
+  splitUploadAudio: typeof splitAudioIntoChunks;
+  chunkQueue: ChunkQueue<RouteChunkQueueInput>;
+  events: SessionEventHub;
+}): Promise<void> {
+  const ffmpegPath = await input.resolveUploadFfmpegPath({ env: process.env });
+  if (!ffmpegPath) {
+    await input.cleanupUpload(input.request.file);
+    input.response.status(501).json(UPLOAD_CHUNKING_UNAVAILABLE);
+    return;
+  }
+
+  const session = await createChunkSession({
+    dataRoot: input.dataRoot,
+    title: input.title,
+    modelId: input.modelId
+  });
+  input.events.publish({
+    type: "session-created",
+    sessionId: session.id,
+    sessionPath: session.path,
+    inProgressTranscriptPath: session.inProgressTranscriptPath
+  });
+
+  const chunkOutputDirectory = join(input.dataRoot, "uploads", "tmp", session.id);
+  const chunkOutputPattern = join(
+    chunkOutputDirectory,
+    `chunk-%06d${extname(input.request.file?.originalname ?? "") || ".webm"}`
+  );
+
+  try {
+    const chunkPaths = await input.splitUploadAudio({
+      ffmpegPath,
+      inputPath: input.request.file!.path,
+      outputDirectory: chunkOutputDirectory,
+      outputPattern: chunkOutputPattern,
+      segmentSeconds: 30
+    });
+
+    for (let index = 0; index < chunkPaths.length; index += 1) {
+      const saved = await saveChunkFile({
+        session,
+        sourcePath: chunkPaths[index],
+        index,
+        startSeconds: index * 30,
+        endSeconds: (index + 1) * 30,
+        overlapSeconds: 0,
+        mimeType: input.request.file?.mimetype || "audio/webm",
+        originalName: input.request.file?.originalname
+      });
+      input.events.publish({ type: "chunk-saved", sessionId: session.id, chunkIndex: saved.index });
+      await input.chunkQueue.enqueue({
+        sessionId: session.id,
+        chunkIndex: saved.index,
+        session,
+        chunkPath: saved.path,
+        modelId: input.modelId,
+        language: input.language,
+        diarization: input.diarization
+      });
+    }
+
+    await input.chunkQueue.waitForSession(session.id);
+    const finalized = await finalizeChunkSession({ session });
+
+    await input.cleanupUpload(input.request.file);
+    await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
+
+    input.events.publish({
+      type: "session-finalized",
+      sessionId: session.id,
+      transcriptPath: finalized.transcriptPath,
+      partial: finalized.partial
+    });
+
+    input.response.status(201).json({
+      sessionId: session.id,
+      sessionPath: session.path,
+      transcriptPath: finalized.transcriptPath,
+      transcriptJsonPath: finalized.transcriptJsonPath,
+      transcript: JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"))
+    });
+  } catch (error) {
+    await input.cleanupUpload(input.request.file);
+    await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
   }
 }
 
