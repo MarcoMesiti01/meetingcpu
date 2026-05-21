@@ -1,7 +1,14 @@
-import { type ChangeEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { type ModelOption, type createApiClient } from "./api/client";
+import { type ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FinalizeSessionResponse,
+  type ModelOption,
+  type SessionEvent,
+  type SessionEventConnection,
+  type createApiClient
+} from "./api/client";
+import type { RecordedAudioChunk, StartChunkedRecordingOptions } from "./audio/recorder";
 
-type Status = "loading" | "ready" | "recording" | "transcribing" | "complete" | "error";
+type Status = "loading" | "ready" | "recording" | "finalizing" | "transcribing" | "complete" | "error";
 type SourceType = "microphone" | "upload";
 
 interface TranscriptionResult {
@@ -12,16 +19,29 @@ interface TranscriptionResult {
   text?: string;
 }
 
-export type AppApi = Pick<ReturnType<typeof createApiClient>, "getModels" | "transcribeAudio">;
+interface SessionPaths {
+  sessionPath?: string;
+  inProgressTranscriptPath?: string;
+  transcriptPath?: string;
+  transcriptJsonPath?: string;
+}
+
+interface TranscriptGroup {
+  id: string;
+  speaker: string;
+  text: string;
+  timestamp?: string;
+}
+
+export type AppApi = Pick<
+  ReturnType<typeof createApiClient>,
+  "getModels" | "transcribeAudio" | "createSession" | "uploadSessionChunk" | "finalizeSession" | "subscribeToSessionEvents"
+>;
 
 export interface AppRecorder {
   start(): Promise<void>;
+  startChunked(options: StartChunkedRecordingOptions): Promise<void>;
   stop(): Promise<Blob>;
-}
-
-interface AppProps {
-  api: AppApi;
-  recorder: AppRecorder;
 }
 
 export default function App({ api, recorder }: AppProps) {
@@ -31,8 +51,16 @@ export default function App({ api, recorder }: AppProps) {
   const [title, setTitle] = useState("Untitled meeting");
   const [error, setError] = useState("");
   const [modelLoadError, setModelLoadError] = useState(false);
-  const [transcript, setTranscript] = useState("");
-  const [sessionPath, setSessionPath] = useState("");
+  const [uploadTranscript, setUploadTranscript] = useState("");
+  const [transcriptGroups, setTranscriptGroups] = useState<TranscriptGroup[]>([]);
+  const [sessionId, setSessionId] = useState("");
+  const [sessionPaths, setSessionPaths] = useState<SessionPaths>({});
+  const [savedChunkCount, setSavedChunkCount] = useState(0);
+  const [transcribedChunkCount, setTranscribedChunkCount] = useState(0);
+  const [failedChunkCount, setFailedChunkCount] = useState(0);
+  const [localRecordingSize, setLocalRecordingSize] = useState(0);
+  const [diarizationStatus, setDiarizationStatus] = useState("Waiting for speaker labels");
+  const eventConnectionRef = useRef<SessionEventConnection | null>(null);
 
   const loadModels = useCallback(async (isActive: () => boolean = () => true) => {
     setError("");
@@ -70,6 +98,8 @@ export default function App({ api, recorder }: AppProps) {
 
     return () => {
       isActive = false;
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
     };
   }, [loadModels]);
 
@@ -77,32 +107,63 @@ export default function App({ api, recorder }: AppProps) {
     () => models.find((model) => model.id === modelId),
     [modelId, models]
   );
-  const canStartRecording = Boolean(modelId) && !modelLoadError && (status === "ready" || status === "complete" || status === "error");
-  const canUpload = Boolean(modelId) && !modelLoadError && status !== "loading" && status !== "recording" && status !== "transcribing";
+  const activeTranscriptText = uploadTranscript || transcriptGroups.map((group) => group.text).join("\n");
+  const canStartRecording = Boolean(modelId) && !modelLoadError && !sessionId && (status === "ready" || status === "complete" || status === "error");
+  const canStopRecording = Boolean(sessionId) && (status === "recording" || status === "error");
+  const canUpload = Boolean(modelId) && !modelLoadError && !sessionId && status !== "loading" && status !== "recording" && status !== "finalizing" && status !== "transcribing";
 
   async function handleStartRecording() {
     setError("");
     setModelLoadError(false);
-    setStatus("recording");
 
     try {
-      await recorder.start();
+      const created = await api.createSession({
+        title: title.trim() || "Untitled meeting",
+        modelId,
+        diarization: true
+      });
+      const connection = api.subscribeToSessionEvents(created.sessionId, {
+        onEvent: handleSessionEvent,
+        onError: (streamError) => setError(getErrorMessage(streamError, "Session event stream failed."))
+      });
+      eventConnectionRef.current = connection;
+
+      await recorder.startChunked({
+        onChunk: (chunk) => uploadChunk(created.sessionId, chunk)
+      });
+
       clearResult();
+      setSessionId(created.sessionId);
+      setSessionPaths({
+        sessionPath: created.sessionPath,
+        inProgressTranscriptPath: created.inProgressTranscriptPath
+      });
+      setStatus("recording");
     } catch (startError) {
-      setError(getErrorMessage(startError, "Could not start recording."));
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
+      setError(getErrorMessage(startError, "Could not start live recording session."));
       setStatus("error");
     }
   }
 
-  async function handleStopAndTranscribe() {
+  async function handleStopAndFinalize() {
+    if (!sessionId) return;
+
     setError("");
-    setStatus("transcribing");
+    setStatus("finalizing");
 
     try {
-      const audio = await recorder.stop();
-      await transcribe(audio, createRecordingFileName(), "microphone");
+      const preservedRecording = await recorder.stop();
+      setLocalRecordingSize(preservedRecording.size);
+      const finalized = await api.finalizeSession(sessionId);
+      applyFinalizedSession(finalized);
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
+      setSessionId("");
+      setStatus("complete");
     } catch (stopError) {
-      setError(getErrorMessage(stopError, "Could not transcribe recording."));
+      setError(getErrorMessage(stopError, "Could not finalize live transcription session."));
       setStatus("error");
     }
   }
@@ -132,15 +193,80 @@ export default function App({ api, recorder }: AppProps) {
       title: title.trim() || "Untitled meeting"
     }) as TranscriptionResult;
 
-    setTranscript(result.transcript?.text || result.text || "");
-    setSessionPath(result.sessionPath || "");
+    setUploadTranscript(result.transcript?.text || result.text || "");
+    setSessionPaths({ sessionPath: result.sessionPath || "" });
     setStatus("complete");
+  }
+
+  async function uploadChunk(activeSessionId: string, chunk: RecordedAudioChunk) {
+    try {
+      await api.uploadSessionChunk({
+        sessionId: activeSessionId,
+        audio: chunk.blob,
+        fileName: chunk.fileName,
+        chunkIndex: chunk.chunkIndex,
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
+        overlapSeconds: chunk.overlapSeconds,
+        modelId,
+        sourceType: "microphone",
+        mimeType: chunk.mimeType
+      });
+    } catch (chunkError) {
+      setError(getErrorMessage(chunkError, `Chunk ${chunk.chunkIndex} upload failed.`));
+      setStatus("error");
+      throw chunkError;
+    }
+  }
+
+  function handleSessionEvent(event: SessionEvent) {
+    if (event.type === "chunk-saved") {
+      setSavedChunkCount((count) => Math.max(count, event.chunkIndex));
+      return;
+    }
+
+    if (event.type === "chunk-transcribed") {
+      setTranscribedChunkCount((count) => Math.max(count, event.chunkIndex));
+      setDiarizationStatus(formatDiarizationStatus(event.diarization));
+      setTranscriptGroups((groups) => mergeTranscriptGroups(groups, event.text, event.chunkIndex));
+      return;
+    }
+
+    if (event.type === "chunk-failed") {
+      setFailedChunkCount((count) => count + 1);
+      setError(`Chunk ${event.chunkIndex} failed: ${event.message}`);
+      return;
+    }
+
+    if (event.type === "session-finalized") {
+      setSessionPaths((paths) => ({
+        ...paths,
+        transcriptPath: event.transcriptPath
+      }));
+    }
+  }
+
+  function applyFinalizedSession(finalized: FinalizeSessionResponse) {
+    setSessionPaths((paths) => ({
+      ...paths,
+      transcriptPath: finalized.transcriptPath,
+      transcriptJsonPath: finalized.transcriptJsonPath
+    }));
+    if (finalized.partial) {
+      setError("Session finalized with a partial transcript. Some chunks failed.");
+    }
   }
 
   function clearResult() {
     setError("");
-    setTranscript("");
-    setSessionPath("");
+    setUploadTranscript("");
+    setTranscriptGroups([]);
+    setSessionPaths({});
+    setSavedChunkCount(0);
+    setTranscribedChunkCount(0);
+    setFailedChunkCount(0);
+    setLocalRecordingSize(0);
+    setDiarizationStatus("Waiting for speaker labels");
   }
 
   return (
@@ -154,53 +280,70 @@ export default function App({ api, recorder }: AppProps) {
           <span className={`status-pill status-${status}`} role="status" aria-live="polite">{formatStatus(status)}</span>
         </header>
 
-        <div className="control-grid">
-          <label className="field">
-            <span>Meeting title</span>
-            <input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="Weekly planning"
-              disabled={status === "recording" || status === "transcribing"}
-            />
-          </label>
+        <section className="dashboard-grid" aria-label="Recording dashboard">
+          <div className="panel control-panel">
+            <div className="panel-heading">
+              <h2>Session controls</h2>
+              <span>{selectedModel?.label || "No model selected"}</span>
+            </div>
 
-          <label className="field">
-            <span>Model</span>
-            <select
-              aria-label="Model"
-              value={modelId}
-              onChange={(event) => setModelId(event.target.value)}
-              disabled={status === "loading" || status === "recording" || status === "transcribing"}
-            >
-              {models.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.label}{model.recommended ? " (recommended)" : ""}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
+            <div className="control-grid">
+              <label className="field">
+                <span>Meeting title</span>
+                <input
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  placeholder="Weekly planning"
+                  disabled={status === "recording" || status === "finalizing" || status === "transcribing"}
+                />
+              </label>
 
-        {selectedModel?.warning ? (
-          <p className="model-warning" role="note">{selectedModel.warning}</p>
-        ) : null}
+              <label className="field">
+                <span>Model</span>
+                <select
+                  aria-label="Model"
+                  value={modelId}
+                  onChange={(event) => setModelId(event.target.value)}
+                  disabled={status === "loading" || status === "recording" || status === "finalizing" || status === "transcribing"}
+                >
+                  {models.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.label}{model.recommended ? " (recommended)" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
 
-        <div className="action-row" role="group" aria-label="Recording controls">
-          <button type="button" className="primary-action" onClick={handleStartRecording} disabled={!canStartRecording}>
-            Start recording
-          </button>
-          <button type="button" className="secondary-action" onClick={handleStopAndTranscribe} disabled={status !== "recording"}>
-            Stop and transcribe
-          </button>
-          {modelLoadError ? (
-            <button type="button" className="secondary-action" onClick={() => void loadModels()} disabled={status === "loading"}>
-              Reload models
-            </button>
-          ) : null}
-        </div>
+            {selectedModel?.warning ? (
+              <p className="model-warning" role="note">{selectedModel.warning}</p>
+            ) : null}
 
-        <div className="upload-panel">
+            <div className="action-row" role="group" aria-label="Recording controls">
+              <button type="button" className="primary-action" onClick={handleStartRecording} disabled={!canStartRecording}>
+                Start recording
+              </button>
+              <button type="button" className="secondary-action" onClick={handleStopAndFinalize} disabled={!canStopRecording}>
+                Stop and finalize
+              </button>
+              {modelLoadError ? (
+                <button type="button" className="secondary-action" onClick={() => void loadModels()} disabled={status === "loading"}>
+                  Reload models
+                </button>
+              ) : null}
+            </div>
+          </div>
+
+          <aside className="panel metrics-panel" aria-label="Status metrics">
+            <Metric label="Session" value={sessionId || "Not started"} />
+            <Metric label="Chunks saved" value={String(savedChunkCount)} />
+            <Metric label="Chunks transcribed" value={String(transcribedChunkCount)} />
+            <Metric label="Chunk failures" value={String(failedChunkCount)} />
+            <Metric label="Speaker labels" value={diarizationStatus} />
+          </aside>
+        </section>
+
+        <section className="panel upload-panel">
           <div>
             <h2>Upload audio</h2>
             <p>Use an existing recording instead of the microphone.</p>
@@ -214,22 +357,34 @@ export default function App({ api, recorder }: AppProps) {
               disabled={!canUpload}
             />
           </label>
-        </div>
+        </section>
 
         {error ? <p className="error-message" role="alert">{error}</p> : null}
 
-        <section className="result-panel" aria-label="Transcription result">
+        <section className="panel result-panel" aria-label="Transcription result">
           <div className="result-header">
-            <h2>Transcript</h2>
-            {sessionPath ? <span>Saved in: {sessionPath}</span> : null}
+            <div>
+              <h2>Transcript workspace</h2>
+              <p>{transcriptSubtitle(status, activeTranscriptText)}</p>
+            </div>
           </div>
-          <div className="transcript-box">
-            {status === "loading" ? "Loading local models..." : null}
-            {status === "recording" ? "Recording from microphone..." : null}
-            {status === "transcribing" ? "Transcribing audio..." : null}
-            {status !== "loading" && status !== "recording" && status !== "transcribing"
-              ? transcript || "No transcript yet."
-              : null}
+
+          <div className="transcript-box" aria-live="polite">
+            {renderTranscript(status, transcriptGroups, uploadTranscript)}
+          </div>
+        </section>
+
+        <section className="panel session-panel" aria-label="Saved files">
+          <h2>Saved files</h2>
+          <div className="path-list">
+            {sessionPaths.sessionPath ? <span>Session: {sessionPaths.sessionPath}</span> : null}
+            {sessionPaths.inProgressTranscriptPath ? <span>In progress: {sessionPaths.inProgressTranscriptPath}</span> : null}
+            {sessionPaths.transcriptPath ? <span>Final transcript: {sessionPaths.transcriptPath}</span> : null}
+            {sessionPaths.transcriptJsonPath ? <span>Transcript JSON: {sessionPaths.transcriptJsonPath}</span> : null}
+            {localRecordingSize > 0 ? <span>Full local recording: preserved in browser memory ({formatBytes(localRecordingSize)})</span> : null}
+            {!sessionPaths.sessionPath && !sessionPaths.inProgressTranscriptPath && !sessionPaths.transcriptPath && localRecordingSize === 0 ? (
+              <span>No saved files yet.</span>
+            ) : null}
           </div>
         </section>
       </section>
@@ -237,12 +392,107 @@ export default function App({ api, recorder }: AppProps) {
   );
 }
 
+interface AppProps {
+  api: AppApi;
+  recorder: AppRecorder;
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function renderTranscript(status: Status, groups: TranscriptGroup[], uploadTranscript: string) {
+  if (status === "loading") return "Loading local models...";
+  if (status === "recording" && groups.length === 0) return "Recording from microphone. Transcript segments will appear as chunks complete.";
+  if (status === "finalizing") return groups.length > 0 ? groups.map(renderTranscriptGroup) : "Finalizing saved chunks...";
+  if (status === "transcribing") return "Transcribing uploaded audio...";
+  if (groups.length > 0) return groups.map(renderTranscriptGroup);
+  return uploadTranscript || "No transcript yet.";
+}
+
+function renderTranscriptGroup(group: TranscriptGroup) {
+  return (
+    <article className="transcript-segment" key={group.id}>
+      <div>
+        <strong>{group.speaker}</strong>
+        {group.timestamp ? <span>{group.timestamp}</span> : null}
+      </div>
+      <p>{group.text}</p>
+    </article>
+  );
+}
+
+function mergeTranscriptGroups(groups: TranscriptGroup[], text: string, chunkIndex: number): TranscriptGroup[] {
+  const parsedLines = parseTranscriptText(text, chunkIndex);
+  if (parsedLines.length === 0) return groups;
+
+  const nextGroups = [...groups];
+  for (const line of parsedLines) {
+    const previous = nextGroups.at(-1);
+    if (previous && previous.speaker === line.speaker) {
+      nextGroups[nextGroups.length - 1] = {
+        ...previous,
+        text: `${previous.text}\n${line.text}`
+      };
+    } else {
+      nextGroups.push(line);
+    }
+  }
+  return nextGroups;
+}
+
+function parseTranscriptText(text: string, chunkIndex: number): TranscriptGroup[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line, index) => {
+      const timestampMatch = line.match(/^\[(?<timestamp>[^\]]+)\]\s*(?<rest>.*)$/);
+      const timestamp = timestampMatch?.groups?.timestamp;
+      const body = timestampMatch?.groups?.rest ?? line;
+      const speakerMatch = body.match(/^(?<speaker>Speaker\s+\d+):\s*(?<text>.*)$/i);
+      const speaker = normalizeSpeaker(speakerMatch?.groups?.speaker);
+      return {
+        id: `${chunkIndex}-${index}-${body}`,
+        speaker,
+        timestamp,
+        text: speakerMatch?.groups?.text?.trim() || body.trim()
+      };
+    });
+}
+
+function normalizeSpeaker(speaker?: string) {
+  if (!speaker) return "Speaker 1";
+  const match = speaker.match(/speaker\s+(\d+)/i);
+  return match ? `Speaker ${match[1]}` : speaker;
+}
+
+function formatDiarizationStatus(diarization: { available: boolean; enabled: boolean; error?: string }) {
+  if (diarization.enabled && diarization.available) return "Available";
+  if (diarization.error) return diarization.error;
+  if (diarization.enabled) return "Fallback labels";
+  return "Not enabled";
+}
+
+function transcriptSubtitle(status: Status, text: string) {
+  if (status === "recording") return "Live chunk transcript";
+  if (status === "finalizing") return "Assembling final transcript from saved chunks";
+  if (text) return "Final transcript";
+  return "Waiting for audio";
+}
+
 function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message.trim().length > 0 ? error.message : fallback;
 }
 
-function createRecordingFileName() {
-  return `recording-${new Date().toISOString().replace(/[:.]/g, "-")}.webm`;
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} KB`;
 }
 
 function formatStatus(status: Status) {
@@ -253,6 +503,8 @@ function formatStatus(status: Status) {
       return "Ready";
     case "recording":
       return "Recording";
+    case "finalizing":
+      return "Finalizing";
     case "transcribing":
       return "Transcribing";
     case "complete":

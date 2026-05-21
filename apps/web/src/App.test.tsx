@@ -1,8 +1,10 @@
 import "@testing-library/jest-dom/vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import App, { type AppApi, type AppRecorder } from "./App";
+import type { SessionEvent, SessionEventHandlers } from "./api/client";
+import type { RecordedAudioChunk } from "./audio/recorder";
 
 describe("App", () => {
   it("loads model choices and starts ready", async () => {
@@ -16,12 +18,27 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
   });
 
-  it("records microphone audio, transcribes it, and shows transcript with saved path", async () => {
+  it("records microphone audio as live chunks, finalizes the session, and does not use legacy microphone transcription", async () => {
     const user = userEvent.setup();
+    let eventHandlers: SessionEventHandlers | undefined;
+    const closeEvents = vi.fn();
     const api = createApi({
-      transcribeAudio: vi.fn().mockResolvedValue({
+      createSession: vi.fn().mockResolvedValue({
+        sessionId: "session-1",
         sessionPath: "C:\\recordings\\meeting-1",
-        transcript: { text: "We agreed to ship the local UI." }
+        inProgressTranscriptPath: "C:\\recordings\\meeting-1\\transcript.in-progress.txt"
+      }),
+      subscribeToSessionEvents: vi.fn((sessionId, handlers) => {
+        expect(sessionId).toBe("session-1");
+        eventHandlers = handlers;
+        return { close: closeEvents };
+      }),
+      uploadSessionChunk: vi.fn().mockResolvedValue({ sessionId: "session-1", chunkIndex: 1, status: "queued" }),
+      finalizeSession: vi.fn().mockResolvedValue({
+        sessionId: "session-1",
+        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
+        partial: false
       })
     });
     const recorder = createRecorder();
@@ -30,19 +47,52 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Start recording" }));
-    await user.click(screen.getByRole("button", { name: "Stop and transcribe" }));
 
     await waitFor(() => {
-      expect(api.transcribeAudio).toHaveBeenCalledWith(expect.objectContaining({
-        audio: expect.any(Blob),
-        fileName: expect.stringMatching(/^recording-.*\.webm$/),
+      expect(api.createSession).toHaveBeenCalledWith({
+        title: "Untitled meeting",
         modelId: "small",
-        sourceType: "microphone"
+        diarization: true
+      });
+    });
+    expect(api.subscribeToSessionEvents).toHaveBeenCalledTimes(1);
+    expect(recorder.startChunked).toHaveBeenCalledTimes(1);
+
+    await recorder.emitChunk(createChunk({ text: "chunk audio" }));
+    await waitFor(() => {
+      expect(api.uploadSessionChunk).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: "session-1",
+        audio: expect.any(Blob),
+        fileName: "chunk-000001.webm",
+        chunkIndex: 1,
+        startSeconds: 0,
+        endSeconds: 30,
+        overlapSeconds: 0,
+        modelId: "small",
+        sourceType: "microphone",
+        mimeType: "audio/webm"
       }));
     });
-    expect(recorder.start).toHaveBeenCalledTimes(1);
-    expect(await screen.findByText("We agreed to ship the local UI.")).toBeInTheDocument();
-    expect(screen.getByText("Saved in: C:\\recordings\\meeting-1")).toBeInTheDocument();
+
+    emitEvent(eventHandlers, {
+      type: "chunk-transcribed",
+      sessionId: "session-1",
+      chunkIndex: 1,
+      text: "[00:00:00] Speaker 1: We agreed to ship the local UI.",
+      diarization: { available: true, enabled: true }
+    });
+
+    expect(await screen.findByText("Speaker 1")).toBeInTheDocument();
+    expect(screen.getByText("We agreed to ship the local UI.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+
+    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+    expect(api.transcribeAudio).not.toHaveBeenCalled();
+    expect(closeEvents).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Session: C:\\recordings\\meeting-1")).toBeInTheDocument();
+    expect(screen.getByText("In progress: C:\\recordings\\meeting-1\\transcript.in-progress.txt")).toBeInTheDocument();
+    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
   });
 
   it("shows a retry action when model loading fails and reloads models", async () => {
@@ -88,7 +138,7 @@ describe("App", () => {
     const user = userEvent.setup();
     const api = createApi();
     const recorder = createRecorder({
-      start: vi.fn()
+      startChunked: vi.fn()
         .mockResolvedValueOnce(undefined)
         .mockRejectedValueOnce(new Error("Microphone permission denied."))
     });
@@ -97,7 +147,14 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Start recording" }));
-    await user.click(screen.getByRole("button", { name: "Stop and transcribe" }));
+    emitEvent(api.lastEventHandlers, {
+      type: "chunk-transcribed",
+      sessionId: "session-1",
+      chunkIndex: 1,
+      text: "Transcript text",
+      diarization: { available: false, enabled: true, error: "No speakers detected." }
+    });
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
     expect(await screen.findByText("Transcript text")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Start recording" }));
@@ -106,10 +163,10 @@ describe("App", () => {
     expect(screen.getByText("Transcript text")).toBeInTheDocument();
   });
 
-  it("shows an error when transcription fails", async () => {
+  it("shows an error when live chunk upload fails", async () => {
     const user = userEvent.setup();
     const api = createApi({
-      transcribeAudio: vi.fn().mockRejectedValue(new Error("Transcription service failed."))
+      uploadSessionChunk: vi.fn().mockRejectedValue(new Error("Chunk upload failed."))
     });
     const recorder = createRecorder();
 
@@ -117,9 +174,27 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Start recording" }));
-    await user.click(screen.getByRole("button", { name: "Stop and transcribe" }));
+    await act(async () => {
+      await expect(recorder.emitChunk(createChunk())).rejects.toThrow("Chunk upload failed.");
+    });
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Transcription service failed.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Chunk upload failed.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+  });
+
+  it("shows an error when live session finalization fails", async () => {
+    const user = userEvent.setup();
+    const api = createApi({
+      finalizeSession: vi.fn().mockRejectedValue(new Error("Finalization failed."))
+    });
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Finalization failed.");
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
   });
 
@@ -144,8 +219,10 @@ describe("App", () => {
   });
 });
 
-function createApi(overrides: Partial<AppApi> = {}): AppApi {
-  return {
+type TestApi = AppApi & { lastEventHandlers?: SessionEventHandlers };
+
+function createApi(overrides: Partial<AppApi> = {}): TestApi {
+  const api = {
     getModels: vi.fn().mockResolvedValue({
       defaultModelId: "small",
       models: [
@@ -158,14 +235,60 @@ function createApi(overrides: Partial<AppApi> = {}): AppApi {
       sessionPath: "C:\\recordings\\meeting-1",
       transcript: { text: "Transcript text" }
     }),
+    createSession: vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      sessionPath: "C:\\recordings\\meeting-1",
+      inProgressTranscriptPath: "C:\\recordings\\meeting-1\\transcript.in-progress.txt"
+    }),
+    uploadSessionChunk: vi.fn().mockResolvedValue({ sessionId: "session-1", chunkIndex: 1, status: "queued" }),
+    finalizeSession: vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
+      transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
+      partial: false
+    }),
+    subscribeToSessionEvents: vi.fn((_sessionId, handlers) => {
+      api.lastEventHandlers = handlers;
+      return { close: vi.fn() };
+    }),
+    ...overrides
+  } as TestApi;
+  return api;
+}
+
+type TestRecorder = AppRecorder & { emitChunk(chunk: RecordedAudioChunk): Promise<void> };
+
+function createRecorder(overrides: Partial<AppRecorder> = {}): TestRecorder {
+  const recorder = {
+    start: vi.fn().mockResolvedValue(undefined),
+    startChunked: vi.fn().mockResolvedValue(undefined),
+    stop: vi.fn().mockResolvedValue(new Blob(["audio"], { type: "audio/webm" })),
+    ...overrides
+  } as TestRecorder;
+  recorder.emitChunk = async (chunk: RecordedAudioChunk) => {
+    const startChunked = recorder.startChunked as ReturnType<typeof vi.fn>;
+    const options = startChunked.mock.calls.at(-1)?.[0];
+    await options.onChunk(chunk);
+  };
+  return recorder;
+}
+
+function createChunk(overrides: Partial<RecordedAudioChunk> & { text?: string } = {}): RecordedAudioChunk {
+  const text = overrides.text ?? "audio";
+  return {
+    chunkIndex: 1,
+    startSeconds: 0,
+    endSeconds: 30,
+    overlapSeconds: 0,
+    blob: new Blob([text], { type: "audio/webm" }),
+    mimeType: "audio/webm",
+    fileExtension: "webm",
+    fileName: "chunk-000001.webm",
     ...overrides
   };
 }
 
-function createRecorder(overrides: Partial<AppRecorder> = {}): AppRecorder {
-  return {
-    start: vi.fn().mockResolvedValue(undefined),
-    stop: vi.fn().mockResolvedValue(new Blob(["audio"], { type: "audio/webm" })),
-    ...overrides
-  };
+function emitEvent(handlers: SessionEventHandlers | undefined, event: SessionEvent) {
+  if (!handlers) throw new Error("Missing session event handlers.");
+  handlers.onEvent(event);
 }
