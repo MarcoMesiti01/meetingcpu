@@ -173,7 +173,11 @@ export function createApiClient(fetchImpl: typeof fetch = fetch, EventSourceCtor
             handlers.onError?.(new Error("Could not parse session event."));
             return;
           }
-          handlers.onEvent(parsedEvent);
+          try {
+            handlers.onEvent(parsedEvent);
+          } catch (error) {
+            handlers.onError?.(normalizeError(error));
+          }
         });
       }
       eventSource.onerror = () => {
@@ -209,4 +213,8 @@ async function readErrorMessage(response: Response, fallback: string) {
     // Some backend failures are empty or plain text. Keep the UI error stable.
   }
   return fallback;
+}
+
+function normalizeError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }

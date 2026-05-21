@@ -172,7 +172,7 @@ describe("BrowserAudioRecorder", () => {
         chunkIndex: 1,
         startSeconds: 0,
         endSeconds: 1.25,
-        overlapSeconds: 0.5,
+        overlapSeconds: 0,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000001.webm"
@@ -195,15 +195,45 @@ describe("BrowserAudioRecorder", () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
-    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    let now = 1_000;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const onChunk = vi.fn();
 
     await recorder.startChunked({ onChunk });
-    recorderCtor.instances[0].emitAudio("audio");
+    now = 31_000;
+    recorderCtor.instances[0].emitAudio("first");
+    now = 61_000;
+    recorderCtor.instances[0].emitAudio("second");
 
     expect(recorderCtor.instances[0].startCalls).toEqual([25_000]);
-    expect(onChunk).toHaveBeenCalledWith(expect.objectContaining({ overlapSeconds: 5 }));
+    expect(onChunk).toHaveBeenNthCalledWith(1, expect.objectContaining({ overlapSeconds: 0 }));
+    expect(onChunk).toHaveBeenNthCalledWith(2, expect.objectContaining({ overlapSeconds: 5 }));
     await recorder.stop();
+  });
+
+  it("clamps overlap metadata below each non-initial chunk duration", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, emitDataOnStop: true });
+    let now = 1_000;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
+    const chunks: Array<{ overlapSeconds: number; startSeconds: number; endSeconds: number }> = [];
+
+    await recorder.startChunked({
+      chunkSeconds: 30,
+      overlapSeconds: 5,
+      onChunk: (chunk) => chunks.push(chunk)
+    });
+    now = 31_000;
+    recorderCtor.instances[0].emitAudio("normal");
+    now = 32_000;
+    await recorder.stop();
+
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toMatchObject({ startSeconds: 0, endSeconds: 30, overlapSeconds: 0 });
+    expect(chunks[1].endSeconds - chunks[1].startSeconds).toBe(1);
+    expect(chunks[1].overlapSeconds).toBeGreaterThanOrEqual(0);
+    expect(chunks[1].overlapSeconds).toBeLessThan(chunks[1].endSeconds - chunks[1].startSeconds);
   });
 
   it("preserves the full chunked recording on stop", async () => {
@@ -380,6 +410,37 @@ describe("BrowserAudioRecorder", () => {
     expect(stopRejected).toBe(true);
     expect(stream.stop).toHaveBeenCalledTimes(1);
   });
+
+  it("waits for pending chunk callbacks before rejecting when recorder stop throws", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({
+      emitDataOnStart: false,
+      stopError: new Error("stop failed")
+    });
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const pendingChunk = createDeferred<void>();
+    const onChunk = vi.fn().mockReturnValue(pendingChunk.promise);
+
+    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    recorderCtor.instances[0].emitAudio("first");
+
+    const stopPromise = recorder.stop();
+    let stopRejected = false;
+    stopPromise.catch(() => {
+      stopRejected = true;
+    });
+    await waitForAsyncTurn();
+
+    expect(stopRejected).toBe(false);
+    expect(onChunk).toHaveBeenCalledTimes(1);
+
+    pendingChunk.resolve();
+
+    await expect(stopPromise).rejects.toThrow("stop failed");
+    expect(stopRejected).toBe(true);
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+  });
 });
 
 function createStream() {
@@ -422,13 +483,15 @@ function createFakeMediaRecorder(options: {
   mimeType?: string;
   startError?: Error;
   startErrorOnce?: Error;
+  stopError?: Error;
 } = {}) {
   const {
     emitDataOnStart = true,
     emitDataOnStop = false,
     mimeType = "audio/webm",
     startError,
-    startErrorOnce
+    startErrorOnce,
+    stopError
   } = options;
   let hasThrownStartErrorOnce = false;
 
@@ -453,6 +516,7 @@ function createFakeMediaRecorder(options: {
     }
 
     stop() {
+      if (stopError) throw stopError;
       if (emitDataOnStop) this.emitAudio();
       this.onstop?.();
     }

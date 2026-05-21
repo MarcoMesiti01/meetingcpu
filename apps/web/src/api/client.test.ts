@@ -246,13 +246,13 @@ describe("api client", () => {
       onError
     });
 
-    expect(() => {
-      EventSourceCtor.instances[0].emit("chunk-saved", {
-        type: "chunk-saved",
-        sessionId: "session-1",
-        chunkIndex: 1
-      });
-    }).toThrow(handlerError);
+    EventSourceCtor.instances[0].emit("chunk-saved", {
+      type: "chunk-saved",
+      sessionId: "session-1",
+      chunkIndex: 1
+    });
+
+    expect(onError).toHaveBeenCalledWith(handlerError);
     expect(onError).not.toHaveBeenCalledWith(new Error("Could not parse session event."));
   });
 });

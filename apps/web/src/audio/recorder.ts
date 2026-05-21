@@ -145,8 +145,14 @@ export class BrowserAudioRecorder {
       try {
         recorder.stop();
       } catch (error) {
-        this.reset();
-        reject(error);
+        void (async () => {
+          try {
+            await this.waitForPendingChunkCallbacks();
+          } finally {
+            this.reset();
+            reject(normalizeError(error));
+          }
+        })();
       }
     });
   }
@@ -195,7 +201,7 @@ export class BrowserAudioRecorder {
       chunkIndex,
       startSeconds,
       endSeconds,
-      overlapSeconds: this.chunkOptions.overlapSeconds,
+      overlapSeconds: effectiveOverlapSeconds(chunkIndex, startSeconds, endSeconds, this.chunkOptions.overlapSeconds),
       blob,
       mimeType,
       fileExtension,
@@ -245,4 +251,22 @@ function extensionForMimeType(mimeType: string): string {
 
 function cadenceMilliseconds(chunkSeconds: number, overlapSeconds: number): number {
   return Math.max(1, (chunkSeconds - overlapSeconds) * 1000);
+}
+
+function effectiveOverlapSeconds(
+  chunkIndex: number,
+  startSeconds: number,
+  endSeconds: number,
+  configuredOverlapSeconds: number
+): number {
+  if (chunkIndex <= 1 || configuredOverlapSeconds <= 0) {
+    return 0;
+  }
+
+  const durationSeconds = Math.max(0, endSeconds - startSeconds);
+  if (durationSeconds <= configuredOverlapSeconds) {
+    return 0;
+  }
+
+  return configuredOverlapSeconds;
 }
