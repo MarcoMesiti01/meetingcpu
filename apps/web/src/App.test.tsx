@@ -182,6 +182,143 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
   });
 
+  it("finalizes an accepted session when recorder stop rejects after a chunk upload failure", async () => {
+    const user = userEvent.setup();
+    const api = createApi({
+      uploadSessionChunk: vi.fn().mockRejectedValue(new Error("Chunk upload failed.")),
+      finalizeSession: vi.fn().mockResolvedValue({
+        sessionId: "session-1",
+        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
+        partial: true
+      })
+    });
+    const recorder = createRecorder({
+      stop: vi.fn().mockRejectedValue(new Error("Chunk upload failed."))
+    });
+
+    render(<App api={api} recorder={recorder} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+    await act(async () => {
+      await expect(recorder.emitChunk(createChunk())).rejects.toThrow("Chunk upload failed.");
+    });
+
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+
+    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Chunk upload failed.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
+  });
+
+  it("does not duplicate transcript text for replayed chunk transcription events", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    await act(async () => {
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-transcribed",
+        sessionId: "session-1",
+        chunkIndex: 1,
+        text: "Transcript text",
+        diarization: { available: true, enabled: true }
+      });
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-transcribed",
+        sessionId: "session-1",
+        chunkIndex: 1,
+        text: "Transcript text",
+        diarization: { available: true, enabled: true }
+      });
+    });
+
+    expect(await screen.findByText("Transcript text")).toBeInTheDocument();
+    expect(screen.getAllByText("Transcript text")).toHaveLength(1);
+    expect(screen.getByText("Chunks transcribed").closest(".metric")).toHaveTextContent("1");
+  });
+
+  it("ignores live events for a different session", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    await act(async () => {
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-transcribed",
+        sessionId: "old-session",
+        chunkIndex: 1,
+        text: "Old transcript text",
+        diarization: { available: true, enabled: true }
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByText("Old transcript text")).not.toBeInTheDocument());
+    expect(screen.getByText("Chunks transcribed").closest(".metric")).toHaveTextContent("0");
+  });
+
+  it("disables controls while recording startup is in progress and prevents duplicate starts", async () => {
+    const user = userEvent.setup();
+    let resolveCreateSession: (value: Awaited<ReturnType<AppApi["createSession"]>>) => void;
+    const createSession = vi.fn().mockImplementation(() => new Promise((resolve) => {
+      resolveCreateSession = resolve;
+    }));
+    const api = createApi({ createSession });
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    const startButton = screen.getByRole("button", { name: "Start recording" });
+    expect(startButton).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stop and finalize" })).toBeDisabled();
+    expect(screen.getByLabelText("Model")).toBeDisabled();
+    await user.click(startButton);
+    expect(createSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveCreateSession({
+        sessionId: "session-1",
+        sessionPath: "C:\\recordings\\meeting-1",
+        inProgressTranscriptPath: "C:\\recordings\\meeting-1\\transcript.in-progress.txt"
+      });
+    });
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Stop and finalize" })).toBeEnabled());
+  });
+
+  it("shows attention status on live event stream errors while allowing active recording finalization", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    await act(async () => {
+      api.lastEventHandlers?.onError(new Error("Stream disconnected."));
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Stream disconnected.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByRole("button", { name: "Stop and finalize" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+  });
+
   it("shows attention status for server-side chunk failures and still allows finalization", async () => {
     const user = userEvent.setup();
     const api = createApi();

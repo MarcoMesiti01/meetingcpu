@@ -8,7 +8,7 @@ import {
 } from "./api/client";
 import type { RecordedAudioChunk, StartChunkedRecordingOptions } from "./audio/recorder";
 
-type Status = "loading" | "ready" | "recording" | "finalizing" | "transcribing" | "complete" | "error";
+type Status = "loading" | "ready" | "starting" | "recording" | "finalizing" | "transcribing" | "complete" | "error";
 type SourceType = "microphone" | "upload";
 
 interface TranscriptionResult {
@@ -61,6 +61,9 @@ export default function App({ api, recorder }: AppProps) {
   const [localRecordingSize, setLocalRecordingSize] = useState(0);
   const [diarizationStatus, setDiarizationStatus] = useState("Waiting for speaker labels");
   const eventConnectionRef = useRef<SessionEventConnection | null>(null);
+  const activeSessionIdRef = useRef("");
+  const startInProgressRef = useRef(false);
+  const transcribedChunkIndexesRef = useRef<Set<number>>(new Set());
 
   const loadModels = useCallback(async (isActive: () => boolean = () => true) => {
     setError("");
@@ -100,6 +103,7 @@ export default function App({ api, recorder }: AppProps) {
       isActive = false;
       eventConnectionRef.current?.close();
       eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
     };
   }, [loadModels]);
 
@@ -108,13 +112,17 @@ export default function App({ api, recorder }: AppProps) {
     [modelId, models]
   );
   const activeTranscriptText = uploadTranscript || transcriptGroups.map((group) => group.text).join("\n");
-  const canStartRecording = Boolean(modelId) && !modelLoadError && !sessionId && (status === "ready" || status === "complete" || status === "error");
+  const canStartRecording = Boolean(modelId) && !modelLoadError && !sessionId && !startInProgressRef.current && (status === "ready" || status === "complete" || status === "error");
   const canStopRecording = Boolean(sessionId) && (status === "recording" || status === "error");
-  const canUpload = Boolean(modelId) && !modelLoadError && !sessionId && status !== "loading" && status !== "recording" && status !== "finalizing" && status !== "transcribing";
+  const canUpload = Boolean(modelId) && !modelLoadError && !sessionId && status !== "loading" && status !== "starting" && status !== "recording" && status !== "finalizing" && status !== "transcribing";
 
   async function handleStartRecording() {
+    if (!canStartRecording) return;
+
+    startInProgressRef.current = true;
     setError("");
     setModelLoadError(false);
+    setStatus("starting");
 
     try {
       const created = await api.createSession({
@@ -122,9 +130,18 @@ export default function App({ api, recorder }: AppProps) {
         modelId,
         diarization: true
       });
+      activeSessionIdRef.current = created.sessionId;
+      setSessionId(created.sessionId);
+      setSessionPaths({
+        sessionPath: created.sessionPath,
+        inProgressTranscriptPath: created.inProgressTranscriptPath
+      });
       const connection = api.subscribeToSessionEvents(created.sessionId, {
         onEvent: handleSessionEvent,
-        onError: (streamError) => setError(getErrorMessage(streamError, "Session event stream failed."))
+        onError: (streamError) => {
+          setError(getErrorMessage(streamError, "Session event stream failed."));
+          setStatus("error");
+        }
       });
       eventConnectionRef.current = connection;
 
@@ -133,6 +150,7 @@ export default function App({ api, recorder }: AppProps) {
       });
 
       clearResult();
+      activeSessionIdRef.current = created.sessionId;
       setSessionId(created.sessionId);
       setSessionPaths({
         sessionPath: created.sessionPath,
@@ -142,8 +160,12 @@ export default function App({ api, recorder }: AppProps) {
     } catch (startError) {
       eventConnectionRef.current?.close();
       eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
+      setSessionId("");
       setError(getErrorMessage(startError, "Could not start live recording session."));
       setStatus("error");
+    } finally {
+      startInProgressRef.current = false;
     }
   }
 
@@ -152,18 +174,30 @@ export default function App({ api, recorder }: AppProps) {
 
     setError("");
     setStatus("finalizing");
+    let stopErrorMessage = "";
 
     try {
       const preservedRecording = await recorder.stop();
       setLocalRecordingSize(preservedRecording.size);
+    } catch (stopError) {
+      stopErrorMessage = getErrorMessage(stopError, "Could not stop live recording cleanly.");
+    }
+
+    try {
       const finalized = await api.finalizeSession(sessionId);
       applyFinalizedSession(finalized);
       eventConnectionRef.current?.close();
       eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
       setSessionId("");
-      setStatus(finalized.partial ? "error" : "complete");
-    } catch (stopError) {
-      setError(getErrorMessage(stopError, "Could not finalize live transcription session."));
+      if (stopErrorMessage) {
+        setError(stopErrorMessage);
+        setStatus("error");
+      } else {
+        setStatus(finalized.partial ? "error" : "complete");
+      }
+    } catch (finalizeError) {
+      setError(getErrorMessage(finalizeError, "Could not finalize live transcription session."));
       setStatus("error");
     }
   }
@@ -220,12 +254,16 @@ export default function App({ api, recorder }: AppProps) {
   }
 
   function handleSessionEvent(event: SessionEvent) {
+    if (event.sessionId !== activeSessionIdRef.current) return;
+
     if (event.type === "chunk-saved") {
       setSavedChunkCount((count) => Math.max(count, event.chunkIndex));
       return;
     }
 
     if (event.type === "chunk-transcribed") {
+      if (transcribedChunkIndexesRef.current.has(event.chunkIndex)) return;
+      transcribedChunkIndexesRef.current.add(event.chunkIndex);
       setTranscribedChunkCount((count) => Math.max(count, event.chunkIndex));
       setDiarizationStatus(formatDiarizationStatus(event.diarization));
       setTranscriptGroups((groups) => mergeTranscriptGroups(groups, event.text, event.chunkIndex));
@@ -268,6 +306,7 @@ export default function App({ api, recorder }: AppProps) {
     setFailedChunkCount(0);
     setLocalRecordingSize(0);
     setDiarizationStatus("Waiting for speaker labels");
+    transcribedChunkIndexesRef.current.clear();
   }
 
   return (
@@ -295,7 +334,7 @@ export default function App({ api, recorder }: AppProps) {
                   value={title}
                   onChange={(event) => setTitle(event.target.value)}
                   placeholder="Weekly planning"
-                  disabled={status === "recording" || status === "finalizing" || status === "transcribing"}
+                  disabled={status === "starting" || status === "recording" || status === "finalizing" || status === "transcribing"}
                 />
               </label>
 
@@ -305,7 +344,7 @@ export default function App({ api, recorder }: AppProps) {
                   aria-label="Model"
                   value={modelId}
                   onChange={(event) => setModelId(event.target.value)}
-                  disabled={status === "loading" || status === "recording" || status === "finalizing" || status === "transcribing"}
+                  disabled={status === "loading" || status === "starting" || status === "recording" || status === "finalizing" || status === "transcribing"}
                 >
                   {models.map((model) => (
                     <option key={model.id} value={model.id}>
@@ -409,6 +448,7 @@ function Metric({ label, value }: { label: string; value: string }) {
 
 function renderTranscript(status: Status, groups: TranscriptGroup[], uploadTranscript: string) {
   if (status === "loading") return "Loading local models...";
+  if (status === "starting") return "Starting live recording session...";
   if (status === "recording" && groups.length === 0) return "Recording from microphone. Transcript segments will appear as chunks complete.";
   if (status === "finalizing") return groups.length > 0 ? groups.map(renderTranscriptGroup) : "Finalizing saved chunks...";
   if (status === "transcribing") return "Transcribing uploaded audio...";
@@ -502,6 +542,8 @@ function formatStatus(status: Status) {
       return "Loading";
     case "ready":
       return "Ready";
+    case "starting":
+      return "Starting";
     case "recording":
       return "Recording";
     case "finalizing":
