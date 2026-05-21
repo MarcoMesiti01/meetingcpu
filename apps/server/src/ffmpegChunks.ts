@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { access, mkdir, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { access, mkdir, readdir, readFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 export interface FfmpegChunkingDependencies {
   env?: NodeJS.ProcessEnv;
@@ -43,6 +43,7 @@ export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Pr
   const spawnImpl = input.spawn ?? nodeSpawn;
   const segmentSeconds = input.segmentSeconds ?? 30;
   await mkdir(input.outputDirectory, { recursive: true });
+  const segmentListPath = join(input.outputDirectory, "chunks.csv");
 
   const child = spawnImpl(
     input.ffmpegPath,
@@ -56,6 +57,10 @@ export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Pr
       "segment",
       "-segment_time",
       String(segmentSeconds),
+      "-segment_list",
+      segmentListPath,
+      "-segment_list_type",
+      "csv",
       "-reset_timestamps",
       "1",
       input.outputPattern
@@ -65,20 +70,76 @@ export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Pr
 
   await waitForClose(child);
 
+  const segmentTimings = await readSegmentTimings(segmentListPath);
   return (await readdir(input.outputDirectory))
     .filter((fileName) => /^chunk-\d{6}\.[^.]+$/.test(fileName))
     .sort()
     .map((fileName, index) => {
-      const startSeconds = index * segmentSeconds;
-      const endSeconds = startSeconds + segmentSeconds;
+      const timing = segmentTimings.get(fileName);
+      const startSeconds = timing?.startSeconds ?? index * segmentSeconds;
+      const endSeconds = timing?.endSeconds ?? startSeconds + segmentSeconds;
       return {
         index,
         path: join(input.outputDirectory, fileName),
         startSeconds,
         endSeconds,
-        durationSeconds: segmentSeconds
+        durationSeconds: endSeconds - startSeconds
       };
     });
+}
+
+async function readSegmentTimings(
+  segmentListPath: string
+): Promise<Map<string, { startSeconds: number; endSeconds: number }>> {
+  try {
+    const rows = (await readFile(segmentListPath, "utf8")).split(/\r?\n/);
+    const timings = new Map<string, { startSeconds: number; endSeconds: number }>();
+    for (const row of rows) {
+      const columns = parseCsvRow(row);
+      if (columns.length < 3) {
+        continue;
+      }
+
+      const startSeconds = Number(columns[1]);
+      const endSeconds = Number(columns[2]);
+      if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || endSeconds <= startSeconds) {
+        continue;
+      }
+      timings.set(basename(columns[0]), { startSeconds, endSeconds });
+    }
+    return timings;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return new Map();
+    }
+    throw error;
+  }
+}
+
+function parseCsvRow(row: string): string[] {
+  const columns: string[] = [];
+  let value = "";
+  let quoted = false;
+  for (let index = 0; index < row.length; index += 1) {
+    const character = row[index];
+    if (character === '"') {
+      if (quoted && row[index + 1] === '"') {
+        value += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+    if (character === "," && !quoted) {
+      columns.push(value);
+      value = "";
+      continue;
+    }
+    value += character;
+  }
+  columns.push(value);
+  return columns;
 }
 
 async function pathExists(path: string, exists?: (path: string) => Promise<boolean>): Promise<boolean> {
@@ -126,4 +187,8 @@ async function waitForClose(child: ChildProcess): Promise<void> {
       reject(new Error(`ffmpeg exited with code ${String(code ?? "unknown")}`));
     });
   });
+}
+
+function isNodeError(error: unknown): error is Error & { code?: string } {
+  return error instanceof Error && "code" in error;
 }

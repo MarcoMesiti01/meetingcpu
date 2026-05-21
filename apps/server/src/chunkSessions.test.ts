@@ -67,6 +67,20 @@ describe("chunk session storage", () => {
     expect(typeof metadata.updatedAt).toBe("string");
   });
 
+  it("defaults chunk sessions to microphone source type and can create upload sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+
+    const microphoneSession = await createChunkSession({ dataRoot: root, modelId: "small" });
+    const uploadSession = await createChunkSession({ dataRoot: root, modelId: "small", sourceType: "upload" });
+
+    await expect(readJson(join(microphoneSession.path, "metadata.json"))).resolves.toMatchObject({
+      sourceType: "microphone"
+    });
+    await expect(readJson(join(uploadSession.path, "metadata.json"))).resolves.toMatchObject({
+      sourceType: "upload"
+    });
+  });
+
   it("saves a chunk file and records timing, mime type, and size in the manifest", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });

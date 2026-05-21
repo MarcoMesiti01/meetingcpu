@@ -511,6 +511,14 @@ async function handleUploadTranscription(input: {
   const session = await createChunkSession({
     dataRoot: input.dataRoot,
     title: input.title,
+    modelId: input.modelId,
+    sourceType: "upload"
+  });
+  const savedUpload = await saveRecording({
+    session,
+    originalName: input.request.file!.originalname,
+    sourcePath: input.request.file!.path,
+    sourceType: "upload",
     modelId: input.modelId
   });
   input.events.publish({
@@ -531,7 +539,7 @@ async function handleUploadTranscription(input: {
     try {
       chunks = await input.splitUploadAudio({
         ffmpegPath,
-        inputPath: input.request.file!.path,
+        inputPath: savedUpload.recordingPath,
         outputDirectory: chunkOutputDirectory,
         outputPattern: chunkOutputPattern,
         segmentSeconds: 30
@@ -591,6 +599,7 @@ async function handleUploadTranscription(input: {
     input.response.status(201).json({
       sessionId: session.id,
       sessionPath: session.path,
+      recordingPath: savedUpload.recordingPath,
       transcriptPath: finalized.transcriptPath,
       transcriptJsonPath: finalized.transcriptJsonPath,
       transcript: JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"))

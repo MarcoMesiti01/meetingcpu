@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import type { ModelId } from "./models.js";
-import { createSession, type Session } from "./sessions.js";
+import { createSession, type Session, type SourceType } from "./sessions.js";
 
 export interface ChunkSession extends Session {
   chunksPath: string;
@@ -62,6 +62,7 @@ export async function createChunkSession(input: {
   now?: Date;
   title?: string;
   modelId: ModelId;
+  sourceType?: SourceType;
 }): Promise<ChunkSession> {
   const baseSession = await createSession({ dataRoot: input.dataRoot, now: input.now, title: input.title });
   const session = withChunkPaths(baseSession);
@@ -71,7 +72,7 @@ export async function createChunkSession(input: {
   await writeFile(session.inProgressTranscriptPath, "");
   await writeMetadata(session, {
     sessionId: session.id,
-    sourceType: "microphone",
+    sourceType: input.sourceType ?? "microphone",
     modelId: input.modelId,
     status: "chunk-session-created",
     chunksPath: session.chunksPath,

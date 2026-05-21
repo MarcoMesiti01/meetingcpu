@@ -751,11 +751,24 @@ describe("server routes", () => {
     expect(transcribe).toHaveBeenCalledTimes(2);
     expect(response.body.sessionId).toContain("upload");
     expect(response.body.sessionPath).toBe(join(dataRoot, "sessions", response.body.sessionId));
+    expect(response.body.recordingPath).toBe(join(response.body.sessionPath, "upload.webm"));
     expect(response.body.transcript.text).toBe("Hello\nworld");
     expect(response.body.transcriptPath).toBe(join(response.body.sessionPath, "transcript.txt"));
     expect(response.body.transcriptJsonPath).toBe(join(response.body.sessionPath, "transcript.json"));
+    expect(splitAudioIntoChunks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        inputPath: response.body.recordingPath
+      })
+    );
+    await expect(readFile(response.body.recordingPath, "utf8")).resolves.toBe("upload-audio");
     await expect(readFile(response.body.transcriptPath, "utf8")).resolves.toBe("Hello\nworld\n");
     await expect(readFile(response.body.transcriptJsonPath, "utf8")).resolves.toContain('"text": "Hello\\nworld"');
+    const metadata = JSON.parse(await readFile(join(response.body.sessionPath, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      sourceType: "upload",
+      recordingPath: response.body.recordingPath,
+      status: "transcribed"
+    });
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
