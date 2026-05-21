@@ -25,7 +25,7 @@ export interface FfmpegAudioChunk {
 }
 
 export async function resolveFfmpegPath(dependencies: FfmpegChunkingDependencies = {}): Promise<string | null> {
-  const envPath = dependencies.env?.FFMPEG_PATH?.trim();
+  const envPath = stripSurroundingQuotes(dependencies.env?.FFMPEG_PATH?.trim() ?? "");
   if (envPath && (await pathExists(envPath, dependencies.exists))) {
     if (await probeFfmpeg(envPath, dependencies.spawn ?? nodeSpawn)) {
       return envPath;
@@ -37,6 +37,15 @@ export async function resolveFfmpegPath(dependencies: FfmpegChunkingDependencies
   }
 
   return null;
+}
+
+function stripSurroundingQuotes(value: string): string {
+  const isDoubleQuoted = value.startsWith('"') && value.endsWith('"');
+  const isSingleQuoted = value.startsWith("'") && value.endsWith("'");
+  if (value.length >= 2 && (isDoubleQuoted || isSingleQuoted)) {
+    return value.slice(1, -1).trim();
+  }
+  return value;
 }
 
 export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Promise<FfmpegAudioChunk[]> {

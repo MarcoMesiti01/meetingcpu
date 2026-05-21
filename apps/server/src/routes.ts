@@ -402,6 +402,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         cleanupUpload,
         resolveUploadFfmpegPath,
         splitUploadAudio,
+        saveUploadedChunk,
         chunkQueue,
         events
       });
@@ -487,7 +488,7 @@ async function cleanupUploadedFile(file: Express.Multer.File | undefined): Promi
   }
 }
 
-async function handleUploadTranscription(input: {
+interface UploadTranscriptionInput {
   request: Request;
   response: Response;
   dataRoot: string;
@@ -498,9 +499,12 @@ async function handleUploadTranscription(input: {
   cleanupUpload: typeof cleanupUploadedFile;
   resolveUploadFfmpegPath: typeof resolveFfmpegPath;
   splitUploadAudio: typeof splitAudioIntoChunks;
+  saveUploadedChunk: typeof saveChunkFile;
   chunkQueue: ChunkQueue<RouteChunkQueueInput>;
   events: SessionEventHub;
-}): Promise<void> {
+}
+
+async function handleUploadTranscription(input: UploadTranscriptionInput): Promise<void> {
   const ffmpegPath = await input.resolveUploadFfmpegPath({ env: process.env });
   if (!ffmpegPath) {
     await input.cleanupUpload(input.request.file);
@@ -545,23 +549,17 @@ async function handleUploadTranscription(input: {
         segmentSeconds: 30
       });
     } catch {
-      await input.cleanupUpload(input.request.file);
-      await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
-      await saveFailedTranscription({
-        session,
-        modelId: input.modelId,
-        error: UPLOAD_CHUNKING_FAILED
-      });
-      input.response.status(500).json({
-        ...UPLOAD_CHUNKING_FAILED,
-        sessionId: session.id,
-        sessionPath: session.path
-      });
+      await failUploadChunking({ upload: input, session, chunkOutputDirectory });
+      return;
+    }
+
+    if (chunks.length === 0) {
+      await failUploadChunking({ upload: input, session, chunkOutputDirectory });
       return;
     }
 
     for (const chunk of chunks) {
-      const saved = await saveChunkFile({
+      const saved = await input.saveUploadedChunk({
         session,
         sourcePath: chunk.path,
         index: chunk.index,
@@ -602,6 +600,7 @@ async function handleUploadTranscription(input: {
       recordingPath: savedUpload.recordingPath,
       transcriptPath: finalized.transcriptPath,
       transcriptJsonPath: finalized.transcriptJsonPath,
+      partial: finalized.partial,
       transcript: JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"))
     });
   } catch (error) {
@@ -609,6 +608,25 @@ async function handleUploadTranscription(input: {
     await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function failUploadChunking(input: {
+  upload: Pick<UploadTranscriptionInput, "request" | "response" | "modelId" | "cleanupUpload">;
+  session: ChunkSession;
+  chunkOutputDirectory: string;
+}): Promise<void> {
+  await input.upload.cleanupUpload(input.upload.request.file);
+  await rm(input.chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
+  await saveFailedTranscription({
+    session: input.session,
+    modelId: input.upload.modelId,
+    error: UPLOAD_CHUNKING_FAILED
+  });
+  input.upload.response.status(500).json({
+    ...UPLOAD_CHUNKING_FAILED,
+    sessionId: input.session.id,
+    sessionPath: input.session.path
+  });
 }
 
 function asyncHandler(handler: (request: Request, response: Response, next: NextFunction) => Promise<void>): RequestHandler {

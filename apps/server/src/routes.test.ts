@@ -755,6 +755,7 @@ describe("server routes", () => {
     expect(response.body.transcript.text).toBe("Hello\nworld");
     expect(response.body.transcriptPath).toBe(join(response.body.sessionPath, "transcript.txt"));
     expect(response.body.transcriptJsonPath).toBe(join(response.body.sessionPath, "transcript.json"));
+    expect(response.body.partial).toBe(false);
     expect(splitAudioIntoChunks).toHaveBeenCalledWith(
       expect.objectContaining({
         inputPath: response.body.recordingPath
@@ -831,6 +832,55 @@ describe("server routes", () => {
     await expect(readFile(response.body.transcriptJsonPath, "utf8")).resolves.toContain('"durationSeconds": 35');
   });
 
+  it("uses the injected chunk saver when chunking uploaded audio", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn(async ({ audioPath }: { audioPath: string }) => ({
+      text: (await readFile(audioPath, "utf8")).trim(),
+      language: "en",
+      durationSeconds: 1,
+      segments: [{ start: 0, end: 1, text: "Injected saver" }],
+      diarization: { available: false, enabled: false }
+    }));
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPath = join(outputDirectory, "chunk-000000.webm");
+      await writeFile(chunkPath, "Injected saver");
+      return [{ index: 0, path: chunkPath, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }];
+    });
+    const saveChunkFile = vi.fn(
+      async ({ session, sourcePath, index, startSeconds, endSeconds, overlapSeconds }: Parameters<NonNullable<Parameters<typeof createApp>[0]["saveChunkFile"]>>[0]) => {
+        const chunkPath = join(session.path, "chunks", "chunk-000000.webm");
+        await writeFile(chunkPath, await readFile(sourcePath));
+        return { index, path: chunkPath, startSeconds, endSeconds, overlapSeconds };
+      }
+    );
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe },
+      saveChunkFile,
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Injected upload saver")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(201);
+
+    expect(saveChunkFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        index: 0,
+        startSeconds: 0,
+        endSeconds: 30
+      })
+    );
+  });
+
   it("returns controlled JSON and cleans upload temp state when upload splitting fails", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const chunkSessionStore = new Map<string, RouteChunkSessionState>();
@@ -874,6 +924,46 @@ describe("server routes", () => {
       }
     });
     await expect(readdir(join(sessionPath, "chunks"))).resolves.toEqual([]);
+  });
+
+  it("returns controlled JSON and records failure when upload splitting produces no chunks", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      return [];
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Empty split")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(500);
+
+    expect(response.body).toMatchObject({
+      code: "UPLOAD_CHUNKING_FAILED",
+      message: "Uploaded audio could not be split into transcription chunks."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(
+      await readFile(join(dataRoot, "sessions", response.body.sessionId, "metadata.json"), "utf8")
+    );
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      error: {
+        code: "UPLOAD_CHUNKING_FAILED",
+        message: "Uploaded audio could not be split into transcription chunks."
+      }
+    });
   });
 
   it("returns a controlled error when uploads exceed the size limit", async () => {

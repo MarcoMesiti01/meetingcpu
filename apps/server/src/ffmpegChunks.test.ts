@@ -28,6 +28,23 @@ describe("ffmpeg chunk helpers", () => {
     expect(spawn).not.toHaveBeenCalledWith("ffmpeg", expect.anything(), expect.anything());
   });
 
+  it("strips surrounding quotes from FFMPEG_PATH before probing it", async () => {
+    const ffmpegPath = "C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe";
+    const spawn = vi.fn(fakeSpawnSuccess);
+    const exists = vi.fn(async (path: string) => path === ffmpegPath);
+
+    await expect(
+      resolveFfmpegPath({
+        env: { FFMPEG_PATH: `"${ffmpegPath}"` },
+        exists,
+        spawn
+      })
+    ).resolves.toBe(ffmpegPath);
+
+    expect(exists).toHaveBeenCalledWith(ffmpegPath);
+    expect(spawn).toHaveBeenCalledWith(ffmpegPath, ["-version"], expect.objectContaining({ stdio: "ignore" }));
+  });
+
   it("returns null when ffmpeg cannot be resolved", async () => {
     const spawn = vi.fn(fakeSpawnFailure);
 
@@ -127,6 +144,23 @@ describe("ffmpeg chunk helpers", () => {
       expect.objectContaining<SpawnOptions>({ stdio: "ignore" })
     );
   });
+
+  it("rejects when ffmpeg exits with a non-zero status", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const inputPath = join(dataRoot, "upload.webm");
+    const outputDirectory = join(dataRoot, "chunks");
+    await writeFile(inputPath, "audio");
+
+    await expect(
+      splitAudioIntoChunks({
+        ffmpegPath: "C:\\bin\\ffmpeg.exe",
+        inputPath,
+        outputDirectory,
+        outputPattern: join(outputDirectory, "chunk-%06d.webm"),
+        spawn: fakeSpawnExit(1)
+      })
+    ).rejects.toThrow("ffmpeg exited with code 1");
+  });
 });
 
 function fakeSpawnSuccess(_command: string, _args: string[], _options: SpawnOptions): ChildProcess {
@@ -143,6 +177,16 @@ function fakeSpawnFailure(_command: string, _args: string[], _options: SpawnOpti
     child.emit("error", new Error("ffmpeg unavailable"));
   });
   return child;
+}
+
+function fakeSpawnExit(code: number) {
+  return (_command: string, _args: string[], _options: SpawnOptions): ChildProcess => {
+    const child = new EventEmitter() as ChildProcess;
+    queueMicrotask(() => {
+      child.emit("close", code, null);
+    });
+    return child;
+  };
 }
 
 function fakeSpawnWithChunks(outputDirectory: string) {
