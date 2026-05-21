@@ -65,6 +65,7 @@ export interface RouteChunkSessionState {
   status: "recording" | "finalizing" | "finalized";
   activeChunkUploads: number;
   chunkUploadWaiters: Array<() => void>;
+  reservedChunkIndexes: Set<number>;
 }
 
 export interface RouteDependencies {
@@ -169,7 +170,8 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       diarization: parseBoolean(request.body.diarization),
       status: "recording",
       activeChunkUploads: 0,
-      chunkUploadWaiters: []
+      chunkUploadWaiters: [],
+      reservedChunkIndexes: new Set()
     };
     chunkSessionStore.set(session.id, state);
     events.publish({
@@ -228,7 +230,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
-    const acceptedUpload = beginChunkUpload(state);
+    const acceptedUpload = beginChunkUpload(state, chunkFields.value.chunkIndex);
     if (!acceptedUpload.ok) {
       await cleanupUpload(request.file);
       response.status(acceptedUpload.statusCode).json(acceptedUpload.body);
@@ -247,10 +249,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
       if (isDuplicateChunk) {
         await cleanupUpload(request.file);
-        response.status(409).json({
-          code: "DUPLICATE_CHUNK_INDEX",
-          message: `Chunk index ${chunkFields.value.chunkIndex} has already been uploaded.`
-        });
+        response.status(409).json(duplicateChunkBody(chunkFields.value.chunkIndex));
         return;
       }
 
@@ -322,7 +321,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       });
     } finally {
       if (releaseAcceptedUpload) {
-        endChunkUpload(state);
+        endChunkUpload(state, chunkFields.value.chunkIndex);
       }
     }
   }));
@@ -620,7 +619,8 @@ function sessionClosedBody(status: "finalizing" | "finalized"): { code: string; 
 }
 
 function beginChunkUpload(
-  state: RouteChunkSessionState
+  state: RouteChunkSessionState,
+  chunkIndex: number
 ):
   | { ok: true }
   | { ok: false; statusCode: number; body: { code: string; message: string } } {
@@ -632,11 +632,21 @@ function beginChunkUpload(
     };
   }
 
+  if (state.reservedChunkIndexes.has(chunkIndex)) {
+    return {
+      ok: false,
+      statusCode: 409,
+      body: duplicateChunkBody(chunkIndex)
+    };
+  }
+
+  state.reservedChunkIndexes.add(chunkIndex);
   state.activeChunkUploads += 1;
   return { ok: true };
 }
 
-function endChunkUpload(state: RouteChunkSessionState): void {
+function endChunkUpload(state: RouteChunkSessionState, chunkIndex: number): void {
+  state.reservedChunkIndexes.delete(chunkIndex);
   state.activeChunkUploads = Math.max(0, state.activeChunkUploads - 1);
   if (state.activeChunkUploads > 0) {
     return;
@@ -686,8 +696,15 @@ async function trackChunkQueueCompletion(input: {
       // This runs after the upload response is accepted. Keep the queue rejection handled even if persistence fails.
     }
   } finally {
-    endChunkUpload(input.state);
+    endChunkUpload(input.state, input.chunkIndex);
   }
+}
+
+function duplicateChunkBody(chunkIndex: number): { code: string; message: string } {
+  return {
+    code: "DUPLICATE_CHUNK_INDEX",
+    message: `Chunk index ${chunkIndex} has already been uploaded.`
+  };
 }
 
 function parseIntegerField(value: unknown): number | null {

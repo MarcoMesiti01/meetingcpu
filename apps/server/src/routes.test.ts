@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, readdir, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -327,6 +327,67 @@ describe("server routes", () => {
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
+  it("rejects overlapping duplicate chunk uploads before saving or enqueueing duplicate work", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkSessionStore = new Map<string, RouteChunkSessionState>();
+    let releaseSave!: () => void;
+    let saveStarted!: () => void;
+    const saveStartedPromise = new Promise<void>((resolve) => {
+      saveStarted = resolve;
+    });
+    const chunkQueue = {
+      enqueue: vi.fn().mockResolvedValue(undefined),
+      waitForSession: vi.fn().mockResolvedValue(undefined)
+    };
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      chunkQueue,
+      chunkSessionStore,
+      saveChunkFile: vi.fn(async ({ session, sourcePath, index, startSeconds, endSeconds, overlapSeconds }) => {
+        saveStarted();
+        await new Promise<void>((resolve) => {
+          releaseSave = resolve;
+        });
+        const chunkPath = join(session.path, "chunks", "chunk-000001.webm");
+        const contents = await readFile(sourcePath);
+        await writeFile(chunkPath, contents);
+        await unlink(sourcePath);
+        return {
+          index,
+          path: chunkPath,
+          startSeconds,
+          endSeconds,
+          overlapSeconds
+        };
+      })
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "Concurrent duplicates", modelId: "small" }).expect(201);
+
+    const firstUpload = uploadChunk(app, created.body.sessionId, 1, "first")
+      .expect(202)
+      .then((response) => response);
+    await saveStartedPromise;
+
+    const duplicate = await uploadChunk(app, created.body.sessionId, 1, "second").expect(409);
+
+    expect(duplicate.body).toEqual({
+      code: "DUPLICATE_CHUNK_INDEX",
+      message: "Chunk index 1 has already been uploaded."
+    });
+    expect(chunkQueue.enqueue).not.toHaveBeenCalled();
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toHaveLength(1);
+
+    releaseSave();
+    await firstUpload;
+
+    const state = chunkSessionStore.get(created.body.sessionId);
+    expect(chunkQueue.enqueue).toHaveBeenCalledTimes(1);
+    expect(state?.activeChunkUploads).toBe(0);
+    expect(state?.reservedChunkIndexes.size).toBe(0);
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+  });
+
   it("ends accepted chunk uploads when duplicate cleanup fails", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const chunkSessionStore = new Map<string, RouteChunkSessionState>();
@@ -351,6 +412,7 @@ describe("server routes", () => {
     const state = chunkSessionStore.get(created.body.sessionId);
     expect(state?.activeChunkUploads).toBe(0);
     expect(state?.chunkUploadWaiters).toEqual([]);
+    expect(state?.reservedChunkIndexes.size).toBe(0);
   });
 
   it("cleans temp uploads and ends accepted chunk uploads when duplicate detection fails", async () => {
@@ -374,6 +436,7 @@ describe("server routes", () => {
     const state = chunkSessionStore.get(created.body.sessionId);
     expect(state?.activeChunkUploads).toBe(0);
     expect(state?.chunkUploadWaiters).toEqual([]);
+    expect(state?.reservedChunkIndexes.size).toBe(0);
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
