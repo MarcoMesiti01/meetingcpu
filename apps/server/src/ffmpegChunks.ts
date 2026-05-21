@@ -16,6 +16,14 @@ export interface SplitAudioIntoChunksInput extends FfmpegChunkingDependencies {
   segmentSeconds?: number;
 }
 
+export interface FfmpegAudioChunk {
+  index: number;
+  path: string;
+  startSeconds: number;
+  endSeconds: number;
+  durationSeconds: number;
+}
+
 export async function resolveFfmpegPath(dependencies: FfmpegChunkingDependencies = {}): Promise<string | null> {
   const envPath = dependencies.env?.FFMPEG_PATH?.trim();
   if (envPath && (await pathExists(envPath, dependencies.exists))) {
@@ -31,8 +39,9 @@ export async function resolveFfmpegPath(dependencies: FfmpegChunkingDependencies
   return null;
 }
 
-export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Promise<string[]> {
+export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Promise<FfmpegAudioChunk[]> {
   const spawnImpl = input.spawn ?? nodeSpawn;
+  const segmentSeconds = input.segmentSeconds ?? 30;
   await mkdir(input.outputDirectory, { recursive: true });
 
   const child = spawnImpl(
@@ -46,7 +55,7 @@ export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Pr
       "-f",
       "segment",
       "-segment_time",
-      String(input.segmentSeconds ?? 30),
+      String(segmentSeconds),
       "-reset_timestamps",
       "1",
       input.outputPattern
@@ -59,7 +68,17 @@ export async function splitAudioIntoChunks(input: SplitAudioIntoChunksInput): Pr
   return (await readdir(input.outputDirectory))
     .filter((fileName) => /^chunk-\d{6}\.[^.]+$/.test(fileName))
     .sort()
-    .map((fileName) => join(input.outputDirectory, fileName));
+    .map((fileName, index) => {
+      const startSeconds = index * segmentSeconds;
+      const endSeconds = startSeconds + segmentSeconds;
+      return {
+        index,
+        path: join(input.outputDirectory, fileName),
+        startSeconds,
+        endSeconds,
+        durationSeconds: segmentSeconds
+      };
+    });
 }
 
 async function pathExists(path: string, exists?: (path: string) => Promise<boolean>): Promise<boolean> {

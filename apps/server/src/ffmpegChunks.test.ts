@@ -49,7 +49,7 @@ describe("ffmpeg chunk helpers", () => {
 
     const spawn = vi.fn(fakeSpawnWithChunks(outputDirectory));
 
-    const chunkPaths = await splitAudioIntoChunks({
+    const chunks = await splitAudioIntoChunks({
       ffmpegPath: "C:\\bin\\ffmpeg.exe",
       inputPath,
       outputDirectory,
@@ -57,9 +57,21 @@ describe("ffmpeg chunk helpers", () => {
       spawn
     });
 
-    expect(chunkPaths).toEqual([
-      join(outputDirectory, "chunk-000000.webm"),
-      join(outputDirectory, "chunk-000001.webm")
+    expect(chunks).toEqual([
+      {
+        index: 0,
+        path: join(outputDirectory, "chunk-000000.webm"),
+        startSeconds: 0,
+        endSeconds: 30,
+        durationSeconds: 30
+      },
+      {
+        index: 1,
+        path: join(outputDirectory, "chunk-000001.webm"),
+        startSeconds: 30,
+        endSeconds: 60,
+        durationSeconds: 30
+      }
     ]);
     expect(spawn).toHaveBeenCalledWith(
       "C:\\bin\\ffmpeg.exe",

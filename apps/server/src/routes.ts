@@ -89,6 +89,10 @@ const UPLOAD_CHUNKING_UNAVAILABLE = {
   code: "UPLOAD_CHUNKING_UNAVAILABLE",
   message: "Upload chunking requires ffmpeg. Install ffmpeg or set FFMPEG_PATH."
 };
+const UPLOAD_CHUNKING_FAILED = {
+  code: "UPLOAD_CHUNKING_FAILED",
+  message: "Uploaded audio could not be split into transcription chunks."
+};
 
 export function createRoutes(dependencies: RouteDependencies): Router {
   const router = Router();
@@ -523,21 +527,38 @@ async function handleUploadTranscription(input: {
   );
 
   try {
-    const chunkPaths = await input.splitUploadAudio({
-      ffmpegPath,
-      inputPath: input.request.file!.path,
-      outputDirectory: chunkOutputDirectory,
-      outputPattern: chunkOutputPattern,
-      segmentSeconds: 30
-    });
+    let chunks: Awaited<ReturnType<typeof splitAudioIntoChunks>>;
+    try {
+      chunks = await input.splitUploadAudio({
+        ffmpegPath,
+        inputPath: input.request.file!.path,
+        outputDirectory: chunkOutputDirectory,
+        outputPattern: chunkOutputPattern,
+        segmentSeconds: 30
+      });
+    } catch {
+      await input.cleanupUpload(input.request.file);
+      await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
+      await saveFailedTranscription({
+        session,
+        modelId: input.modelId,
+        error: UPLOAD_CHUNKING_FAILED
+      });
+      input.response.status(500).json({
+        ...UPLOAD_CHUNKING_FAILED,
+        sessionId: session.id,
+        sessionPath: session.path
+      });
+      return;
+    }
 
-    for (let index = 0; index < chunkPaths.length; index += 1) {
+    for (const chunk of chunks) {
       const saved = await saveChunkFile({
         session,
-        sourcePath: chunkPaths[index],
-        index,
-        startSeconds: index * 30,
-        endSeconds: (index + 1) * 30,
+        sourcePath: chunk.path,
+        index: chunk.index,
+        startSeconds: chunk.startSeconds,
+        endSeconds: chunk.endSeconds,
         overlapSeconds: 0,
         mimeType: input.request.file?.mimetype || "audio/webm",
         originalName: input.request.file?.originalname
