@@ -505,57 +505,50 @@ interface UploadTranscriptionInput {
 }
 
 async function handleUploadTranscription(input: UploadTranscriptionInput): Promise<void> {
-  const ffmpegPath = await input.resolveUploadFfmpegPath({ env: process.env });
-  if (!ffmpegPath) {
-    await input.cleanupUpload(input.request.file);
-    input.response.status(501).json(UPLOAD_CHUNKING_UNAVAILABLE);
-    return;
-  }
-
-  const session = await createChunkSession({
-    dataRoot: input.dataRoot,
-    title: input.title,
-    modelId: input.modelId,
-    sourceType: "upload"
-  });
-  const savedUpload = await saveRecording({
-    session,
-    originalName: input.request.file!.originalname,
-    sourcePath: input.request.file!.path,
-    sourceType: "upload",
-    modelId: input.modelId
-  });
-  input.events.publish({
-    type: "session-created",
-    sessionId: session.id,
-    sessionPath: session.path,
-    inProgressTranscriptPath: session.inProgressTranscriptPath
-  });
-
-  const chunkOutputDirectory = join(input.dataRoot, "uploads", "tmp", session.id);
-  const chunkOutputPattern = join(
-    chunkOutputDirectory,
-    `chunk-%06d${extname(input.request.file?.originalname ?? "") || ".webm"}`
-  );
-
+  let session: ChunkSession | null = null;
+  let chunkOutputDirectory: string | null = null;
   try {
-    let chunks: Awaited<ReturnType<typeof splitAudioIntoChunks>>;
-    try {
-      chunks = await input.splitUploadAudio({
-        ffmpegPath,
-        inputPath: savedUpload.recordingPath,
-        outputDirectory: chunkOutputDirectory,
-        outputPattern: chunkOutputPattern,
-        segmentSeconds: 30
-      });
-    } catch {
-      await failUploadChunking({ upload: input, session, chunkOutputDirectory });
+    const ffmpegPath = await input.resolveUploadFfmpegPath({ env: process.env });
+    if (!ffmpegPath) {
+      await input.cleanupUpload(input.request.file);
+      input.response.status(501).json(UPLOAD_CHUNKING_UNAVAILABLE);
       return;
     }
 
+    session = await createChunkSession({
+      dataRoot: input.dataRoot,
+      title: input.title,
+      modelId: input.modelId,
+      sourceType: "upload"
+    });
+    const savedUpload = await saveRecording({
+      session,
+      originalName: input.request.file!.originalname,
+      sourcePath: input.request.file!.path,
+      sourceType: "upload",
+      modelId: input.modelId
+    });
+    input.events.publish({
+      type: "session-created",
+      sessionId: session.id,
+      sessionPath: session.path,
+      inProgressTranscriptPath: session.inProgressTranscriptPath
+    });
+
+    chunkOutputDirectory = join(input.dataRoot, "uploads", "tmp", session.id);
+    const chunkOutputPattern = join(
+      chunkOutputDirectory,
+      `chunk-%06d${extname(input.request.file?.originalname ?? "") || ".webm"}`
+    );
+    const chunks = await input.splitUploadAudio({
+      ffmpegPath,
+      inputPath: savedUpload.recordingPath,
+      outputDirectory: chunkOutputDirectory,
+      outputPattern: chunkOutputPattern,
+      segmentSeconds: 30
+    });
     if (chunks.length === 0) {
-      await failUploadChunking({ upload: input, session, chunkOutputDirectory });
-      return;
+      throw new Error("Upload splitting produced no chunks.");
     }
 
     for (const chunk of chunks) {
@@ -583,6 +576,7 @@ async function handleUploadTranscription(input: UploadTranscriptionInput): Promi
 
     await input.chunkQueue.waitForSession(session.id);
     const finalized = await finalizeChunkSession({ session });
+    const transcript = JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"));
 
     await input.cleanupUpload(input.request.file);
     await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
@@ -601,31 +595,32 @@ async function handleUploadTranscription(input: UploadTranscriptionInput): Promi
       transcriptPath: finalized.transcriptPath,
       transcriptJsonPath: finalized.transcriptJsonPath,
       partial: finalized.partial,
-      transcript: JSON.parse(await readFile(finalized.transcriptJsonPath, "utf8"))
+      transcript
     });
-  } catch (error) {
-    await input.cleanupUpload(input.request.file);
-    await rm(chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
-    throw error;
+  } catch {
+    await failUploadChunking({ upload: input, session, chunkOutputDirectory });
   }
 }
 
 async function failUploadChunking(input: {
   upload: Pick<UploadTranscriptionInput, "request" | "response" | "modelId" | "cleanupUpload">;
-  session: ChunkSession;
-  chunkOutputDirectory: string;
+  session: ChunkSession | null;
+  chunkOutputDirectory: string | null;
 }): Promise<void> {
   await input.upload.cleanupUpload(input.upload.request.file);
-  await rm(input.chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
-  await saveFailedTranscription({
-    session: input.session,
-    modelId: input.upload.modelId,
-    error: UPLOAD_CHUNKING_FAILED
-  });
+  if (input.chunkOutputDirectory) {
+    await rm(input.chunkOutputDirectory, { recursive: true, force: true }).catch(() => undefined);
+  }
+  if (input.session) {
+    await saveFailedTranscription({
+      session: input.session,
+      modelId: input.upload.modelId,
+      error: UPLOAD_CHUNKING_FAILED
+    });
+  }
   input.upload.response.status(500).json({
     ...UPLOAD_CHUNKING_FAILED,
-    sessionId: input.session.id,
-    sessionPath: input.session.path
+    ...(input.session ? { sessionId: input.session.id, sessionPath: input.session.path } : {})
   });
 }
 

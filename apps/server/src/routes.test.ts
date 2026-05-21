@@ -881,6 +881,100 @@ describe("server routes", () => {
     );
   });
 
+  it("returns controlled JSON and records failure when upload chunk saving fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPath = join(outputDirectory, "chunk-000000.webm");
+      await writeFile(chunkPath, "Unsaved chunk");
+      return [{ index: 0, path: chunkPath, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }];
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient(),
+      saveChunkFile: vi.fn(async () => {
+        throw new Error("chunk disk full");
+      }),
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Save chunk failure")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(500);
+
+    expect(response.body).toMatchObject({
+      code: "UPLOAD_CHUNKING_FAILED",
+      message: "Uploaded audio could not be split into transcription chunks."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(
+      await readFile(join(dataRoot, "sessions", response.body.sessionId, "metadata.json"), "utf8")
+    );
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      error: {
+        code: "UPLOAD_CHUNKING_FAILED",
+        message: "Uploaded audio could not be split into transcription chunks."
+      }
+    });
+  });
+
+  it("returns a partial upload transcript when at least one chunk fails transcription", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: "Good upload chunk.",
+        language: "en",
+        durationSeconds: 2,
+        segments: [{ start: 0, end: 2, text: "Good upload chunk." }],
+        diarization: { available: false, enabled: false }
+      })
+      .mockRejectedValueOnce({ code: "MODEL_UNAVAILABLE", status: 503, message: "Model is unavailable." });
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPaths = [join(outputDirectory, "chunk-000000.webm"), join(outputDirectory, "chunk-000001.webm")];
+      await writeFile(chunkPaths[0], "good");
+      await writeFile(chunkPaths[1], "bad");
+      return [
+        { index: 0, path: chunkPaths[0], startSeconds: 0, endSeconds: 30, durationSeconds: 30 },
+        { index: 1, path: chunkPaths[1], startSeconds: 30, endSeconds: 60, durationSeconds: 30 }
+      ];
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe },
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Partial upload")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(201);
+
+    expect(response.body.partial).toBe(true);
+    expect(response.body.transcript.text).toBe("Good upload chunk.");
+    const metadata = JSON.parse(await readFile(join(response.body.sessionPath, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      status: "transcribed-partial",
+      partial: true,
+      failedChunks: [{ chunkIndex: 1, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
+    });
+  });
+
   it("returns controlled JSON and cleans upload temp state when upload splitting fails", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const chunkSessionStore = new Map<string, RouteChunkSessionState>();
