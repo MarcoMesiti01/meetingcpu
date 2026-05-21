@@ -149,7 +149,7 @@ describe("BrowserAudioRecorder", () => {
     expect(blob.type).toBe("audio/webm");
   });
 
-  it("starts chunked recording with a timeslice and emits clock-based chunk metadata", async () => {
+  it("starts chunked recording with overlap cadence and emits clock-based chunk metadata", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, mimeType: "audio/webm;codecs=opus" });
@@ -157,14 +157,14 @@ describe("BrowserAudioRecorder", () => {
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const chunks: unknown[] = [];
 
-    await recorder.startChunked({ chunkSeconds: 2, onChunk: (chunk) => chunks.push(chunk) });
+    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk: (chunk) => chunks.push(chunk) });
     const instance = recorderCtor.instances[0];
     now = 2_250;
     instance.emitAudio("first");
     now = 4_750;
     instance.emitAudio("second");
 
-    expect(instance.startCalls).toEqual([2000]);
+    expect(instance.startCalls).toEqual([1500]);
     expect(chunks[0]).toHaveProperty("blob");
     expect(await readBlobAsText((chunks[0] as { blob: Blob }).blob)).toBe("first");
     expect(chunks).toMatchObject([
@@ -172,6 +172,7 @@ describe("BrowserAudioRecorder", () => {
         chunkIndex: 1,
         startSeconds: 0,
         endSeconds: 1.25,
+        overlapSeconds: 0.5,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000001.webm"
@@ -180,6 +181,7 @@ describe("BrowserAudioRecorder", () => {
         chunkIndex: 2,
         startSeconds: 1.25,
         endSeconds: 3.75,
+        overlapSeconds: 0.5,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000002.webm"
@@ -189,15 +191,18 @@ describe("BrowserAudioRecorder", () => {
     await recorder.stop();
   });
 
-  it("uses a 30 second timeslice by default for chunked recording", async () => {
+  it("uses a 25 second overlap cadence by default for chunked recording", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const onChunk = vi.fn();
 
-    await recorder.startChunked({ onChunk: vi.fn() });
+    await recorder.startChunked({ onChunk });
+    recorderCtor.instances[0].emitAudio("audio");
 
-    expect(recorderCtor.instances[0].startCalls).toEqual([30_000]);
+    expect(recorderCtor.instances[0].startCalls).toEqual([25_000]);
+    expect(onChunk).toHaveBeenCalledWith(expect.objectContaining({ overlapSeconds: 5 }));
     await recorder.stop();
   });
 
@@ -331,6 +336,45 @@ describe("BrowserAudioRecorder", () => {
     expect(stopRejected).toBe(false);
 
     slowChunk.resolve();
+
+    await expect(stopPromise).rejects.toThrow("upload failed");
+    expect(stopRejected).toBe(true);
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a pending rejection and final stop chunk before rejecting stop", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({
+      emitDataOnStart: false,
+      emitDataOnStop: true
+    });
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const failedChunk = createDeferred<void>();
+    const finalChunk = createDeferred<void>();
+    const uploadError = new Error("upload failed");
+    const onChunk = vi.fn()
+      .mockReturnValueOnce(failedChunk.promise)
+      .mockReturnValueOnce(finalChunk.promise);
+
+    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    recorderCtor.instances[0].emitAudio("first");
+
+    const stopPromise = recorder.stop();
+    let stopRejected = false;
+    stopPromise.catch(() => {
+      stopRejected = true;
+    });
+    await Promise.resolve();
+
+    expect(onChunk).toHaveBeenCalledTimes(2);
+
+    failedChunk.reject(uploadError);
+    await waitForAsyncTurn();
+
+    expect(stopRejected).toBe(false);
+
+    finalChunk.resolve();
 
     await expect(stopPromise).rejects.toThrow("upload failed");
     expect(stopRejected).toBe(true);

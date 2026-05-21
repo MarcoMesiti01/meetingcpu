@@ -38,7 +38,7 @@ export interface UploadSessionChunkInput {
   chunkIndex: number;
   startSeconds: number;
   endSeconds: number;
-  overlapSeconds?: number;
+  overlapSeconds: number;
   modelId?: string;
   sourceType?: "microphone" | "upload";
   mimeType?: string;
@@ -133,7 +133,7 @@ export function createApiClient(fetchImpl: typeof fetch = fetch, EventSourceCtor
       form.set("chunkIndex", String(input.chunkIndex));
       form.set("startSeconds", String(input.startSeconds));
       form.set("endSeconds", String(input.endSeconds));
-      form.set("overlapSeconds", String(input.overlapSeconds ?? 0));
+      form.set("overlapSeconds", String(input.overlapSeconds));
       if (input.modelId) form.set("modelId", input.modelId);
       if (input.sourceType) form.set("sourceType", input.sourceType);
       if (input.mimeType) form.set("mimeType", input.mimeType);

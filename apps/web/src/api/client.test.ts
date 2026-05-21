@@ -145,6 +145,7 @@ describe("api client", () => {
       chunkIndex: 1,
       startSeconds: 0,
       endSeconds: 30,
+      overlapSeconds: 5,
       modelId: "small",
       sourceType: "microphone",
       mimeType: "audio/webm"
@@ -160,7 +161,7 @@ describe("api client", () => {
     expect(form.get("chunkIndex")).toBe("1");
     expect(form.get("startSeconds")).toBe("0");
     expect(form.get("endSeconds")).toBe("30");
-    expect(form.get("overlapSeconds")).toBe("0");
+    expect(form.get("overlapSeconds")).toBe("5");
     expect(form.get("modelId")).toBe("small");
     expect(form.get("sourceType")).toBe("microphone");
     expect(form.get("mimeType")).toBe("audio/webm");

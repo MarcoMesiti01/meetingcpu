@@ -4,6 +4,7 @@ export interface RecordedAudioChunk {
   chunkIndex: number;
   startSeconds: number;
   endSeconds: number;
+  overlapSeconds: number;
   blob: Blob;
   mimeType: string;
   fileExtension: string;
@@ -12,10 +13,12 @@ export interface RecordedAudioChunk {
 
 export interface StartChunkedRecordingOptions {
   chunkSeconds?: number;
+  overlapSeconds?: number;
   onChunk: (chunk: RecordedAudioChunk) => void | Promise<void>;
 }
 
 const DEFAULT_CHUNK_SECONDS = 30;
+const DEFAULT_OVERLAP_SECONDS = 5;
 const DEFAULT_MIME_TYPE = "audio/webm";
 
 export class BrowserAudioRecorder {
@@ -87,8 +90,11 @@ export class BrowserAudioRecorder {
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
       this.lastChunkEndSeconds = 0;
+      const chunkSeconds = options.chunkSeconds ?? DEFAULT_CHUNK_SECONDS;
+      const overlapSeconds = options.overlapSeconds ?? DEFAULT_OVERLAP_SECONDS;
       this.chunkOptions = {
-        chunkSeconds: options.chunkSeconds ?? DEFAULT_CHUNK_SECONDS,
+        chunkSeconds,
+        overlapSeconds,
         onChunk: options.onChunk
       };
 
@@ -98,7 +104,7 @@ export class BrowserAudioRecorder {
         this.trackChunkedData(event.data);
       };
       this.chunkRecordingStartedAtMs = this.now();
-      mediaRecorder.start(this.chunkOptions.chunkSeconds * 1000);
+      mediaRecorder.start(cadenceMilliseconds(chunkSeconds, overlapSeconds));
     } catch (error) {
       this.reset();
       throw error;
@@ -189,6 +195,7 @@ export class BrowserAudioRecorder {
       chunkIndex,
       startSeconds,
       endSeconds,
+      overlapSeconds: this.chunkOptions.overlapSeconds,
       blob,
       mimeType,
       fileExtension,
@@ -234,4 +241,8 @@ function extensionForMimeType(mimeType: string): string {
     return "wav";
   }
   return "webm";
+}
+
+function cadenceMilliseconds(chunkSeconds: number, overlapSeconds: number): number {
+  return Math.max(1, (chunkSeconds - overlapSeconds) * 1000);
 }
