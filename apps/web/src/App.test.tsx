@@ -298,6 +298,37 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Stop and finalize" })).toBeEnabled());
   });
 
+  it("ignores duplicate start clicks before the startup render completes", async () => {
+    const pendingSessions: Array<(value: Awaited<ReturnType<AppApi["createSession"]>>) => void> = [];
+    const createSession = vi.fn().mockImplementation(() => new Promise((resolve) => {
+      pendingSessions.push(resolve);
+    }));
+    const api = createApi({ createSession });
+    const recorder = createRecorder();
+
+    render(<App api={api} recorder={recorder} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    const startButton = screen.getByRole("button", { name: "Start recording" });
+
+    act(() => {
+      startButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      startButton.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingSessions[0]({
+        sessionId: "session-1",
+        sessionPath: "C:\\recordings\\meeting-1",
+        inProgressTranscriptPath: "C:\\recordings\\meeting-1\\transcript.in-progress.txt"
+      });
+    });
+
+    await waitFor(() => expect(recorder.startChunked).toHaveBeenCalledTimes(1));
+  });
+
   it("shows attention status on live event stream errors while allowing active recording finalization", async () => {
     const user = userEvent.setup();
     const api = createApi();
@@ -344,6 +375,35 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
 
     await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+  });
+
+  it("does not recount replayed server-side chunk failure events", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    act(() => {
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-failed",
+        sessionId: "session-1",
+        chunkIndex: 2,
+        message: "Decoder timed out."
+      });
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-failed",
+        sessionId: "session-1",
+        chunkIndex: 2,
+        message: "Decoder timed out."
+      });
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Chunk 2 failed: Decoder timed out.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByText("Chunk failures").closest(".metric")).toHaveTextContent("1");
   });
 
   it("shows an error when live session finalization fails", async () => {

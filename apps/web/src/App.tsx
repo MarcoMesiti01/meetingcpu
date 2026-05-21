@@ -64,6 +64,7 @@ export default function App({ api, recorder }: AppProps) {
   const activeSessionIdRef = useRef("");
   const startInProgressRef = useRef(false);
   const transcribedChunkIndexesRef = useRef<Set<number>>(new Set());
+  const failedChunkIndexesRef = useRef<Set<number>>(new Set());
 
   const loadModels = useCallback(async (isActive: () => boolean = () => true) => {
     setError("");
@@ -117,9 +118,13 @@ export default function App({ api, recorder }: AppProps) {
   const canUpload = Boolean(modelId) && !modelLoadError && !sessionId && status !== "loading" && status !== "starting" && status !== "recording" && status !== "finalizing" && status !== "transcribing";
 
   async function handleStartRecording() {
-    if (!canStartRecording) return;
-
+    if (startInProgressRef.current) return;
     startInProgressRef.current = true;
+    if (!Boolean(modelId) || modelLoadError || sessionId || !(status === "ready" || status === "complete" || status === "error")) {
+      startInProgressRef.current = false;
+      return;
+    }
+
     setError("");
     setModelLoadError(false);
     setStatus("starting");
@@ -271,6 +276,8 @@ export default function App({ api, recorder }: AppProps) {
     }
 
     if (event.type === "chunk-failed") {
+      if (failedChunkIndexesRef.current.has(event.chunkIndex)) return;
+      failedChunkIndexesRef.current.add(event.chunkIndex);
       setFailedChunkCount((count) => count + 1);
       setError(`Chunk ${event.chunkIndex} failed: ${event.message}`);
       setStatus("error");
@@ -307,6 +314,7 @@ export default function App({ api, recorder }: AppProps) {
     setLocalRecordingSize(0);
     setDiarizationStatus("Waiting for speaker labels");
     transcribedChunkIndexesRef.current.clear();
+    failedChunkIndexesRef.current.clear();
   }
 
   return (
