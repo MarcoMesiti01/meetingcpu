@@ -148,7 +148,6 @@ export class BrowserAudioRecorder {
   private trackChunkedData(blob: Blob) {
     const pending = this.handleChunkedData(blob).catch((error) => {
       this.chunkCallbackError = this.chunkCallbackError ?? error;
-      this.cleanupMedia();
       throw error;
     });
     this.pendingChunkCallbacks.add(pending);
@@ -161,7 +160,12 @@ export class BrowserAudioRecorder {
 
   private async waitForPendingChunkCallbacks() {
     while (this.pendingChunkCallbacks.size > 0) {
-      await Promise.all([...this.pendingChunkCallbacks]);
+      const results = await Promise.allSettled([...this.pendingChunkCallbacks]);
+      for (const result of results) {
+        if (result.status === "rejected") {
+          this.chunkCallbackError = this.chunkCallbackError ?? result.reason;
+        }
+      }
     }
   }
 

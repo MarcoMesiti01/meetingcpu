@@ -301,6 +301,41 @@ describe("BrowserAudioRecorder", () => {
     await expect(recorder.stop()).rejects.toThrow("upload failed");
     expect(stream.stop).toHaveBeenCalledTimes(1);
   });
+
+  it("waits for all pending chunk callbacks before rejecting stop when one fails", async () => {
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    const failedChunk = createDeferred<void>();
+    const slowChunk = createDeferred<void>();
+    const uploadError = new Error("upload failed");
+    const onChunk = vi.fn()
+      .mockReturnValueOnce(failedChunk.promise)
+      .mockReturnValueOnce(slowChunk.promise);
+
+    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    recorderCtor.instances[0].emitAudio("first");
+    recorderCtor.instances[0].emitAudio("second");
+
+    const stopPromise = recorder.stop();
+    let stopRejected = false;
+    stopPromise.catch(() => {
+      stopRejected = true;
+    });
+    await Promise.resolve();
+
+    failedChunk.reject(uploadError);
+    await waitForAsyncTurn();
+
+    expect(stopRejected).toBe(false);
+
+    slowChunk.resolve();
+
+    await expect(stopPromise).rejects.toThrow("upload failed");
+    expect(stopRejected).toBe(true);
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+  });
 });
 
 function createStream() {
@@ -313,11 +348,13 @@ function createStream() {
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((promiseResolve) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
     resolve = promiseResolve;
+    reject = promiseReject;
   });
 
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function readBlobAsText(blob: Blob): Promise<string> {
@@ -326,6 +363,12 @@ function readBlobAsText(blob: Blob): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("Could not read blob."));
     reader.onload = () => resolve(String(reader.result ?? ""));
     reader.readAsText(blob);
+  });
+}
+
+function waitForAsyncTurn(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
   });
 }
 
