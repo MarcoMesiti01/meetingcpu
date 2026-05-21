@@ -161,7 +161,7 @@ export default function App({ api, recorder }: AppProps) {
       eventConnectionRef.current?.close();
       eventConnectionRef.current = null;
       setSessionId("");
-      setStatus("complete");
+      setStatus(finalized.partial ? "error" : "complete");
     } catch (stopError) {
       setError(getErrorMessage(stopError, "Could not finalize live transcription session."));
       setStatus("error");
@@ -235,6 +235,7 @@ export default function App({ api, recorder }: AppProps) {
     if (event.type === "chunk-failed") {
       setFailedChunkCount((count) => count + 1);
       setError(`Chunk ${event.chunkIndex} failed: ${event.message}`);
+      setStatus("error");
       return;
     }
 

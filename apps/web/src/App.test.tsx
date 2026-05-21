@@ -182,6 +182,33 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
   });
 
+  it("shows attention status for server-side chunk failures and still allows finalization", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    act(() => {
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-failed",
+        sessionId: "session-1",
+        chunkIndex: 2,
+        message: "Decoder timed out."
+      });
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Chunk 2 failed: Decoder timed out.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByText("Chunk failures").closest(".metric")).toHaveTextContent("1");
+
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+
+    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+  });
+
   it("shows an error when live session finalization fails", async () => {
     const user = userEvent.setup();
     const api = createApi({
@@ -196,6 +223,28 @@ describe("App", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Finalization failed.");
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+  });
+
+  it("keeps attention status when live session finalizes with a partial transcript", async () => {
+    const user = userEvent.setup();
+    const api = createApi({
+      finalizeSession: vi.fn().mockResolvedValue({
+        sessionId: "session-1",
+        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
+        partial: true
+      })
+    });
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+    await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Session finalized with a partial transcript.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
   });
 
   it("transcribes uploaded audio with upload source type", async () => {
