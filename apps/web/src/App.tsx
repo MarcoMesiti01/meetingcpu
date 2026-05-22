@@ -63,6 +63,7 @@ export default function App({ api, recorder }: AppProps) {
   const eventConnectionRef = useRef<SessionEventConnection | null>(null);
   const activeSessionIdRef = useRef("");
   const startInProgressRef = useRef(false);
+  const clientChunkUploadFailedRef = useRef(false);
   const transcribedChunkIndexesRef = useRef<Set<number>>(new Set());
   const failedChunkIndexesRef = useRef<Set<number>>(new Set());
 
@@ -128,6 +129,7 @@ export default function App({ api, recorder }: AppProps) {
     setError("");
     setModelLoadError(false);
     setStatus("starting");
+    clientChunkUploadFailedRef.current = false;
 
     try {
       const created = await api.createSession({
@@ -186,6 +188,16 @@ export default function App({ api, recorder }: AppProps) {
       setLocalRecordingSize(preservedRecording.size);
     } catch (stopError) {
       stopErrorMessage = getErrorMessage(stopError, "Could not stop live recording cleanly.");
+    }
+
+    if (clientChunkUploadFailedRef.current) {
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
+      setSessionId("");
+      setError(stopErrorMessage || "A microphone chunk upload failed. The session was not finalized because audio may be missing.");
+      setStatus("error");
+      return;
     }
 
     try {
@@ -252,6 +264,7 @@ export default function App({ api, recorder }: AppProps) {
         mimeType: chunk.mimeType
       });
     } catch (chunkError) {
+      clientChunkUploadFailedRef.current = true;
       setError(getErrorMessage(chunkError, `Chunk ${chunk.chunkIndex} upload failed.`));
       setStatus("error");
       throw chunkError;
@@ -313,6 +326,7 @@ export default function App({ api, recorder }: AppProps) {
     setFailedChunkCount(0);
     setLocalRecordingSize(0);
     setDiarizationStatus("Waiting for speaker labels");
+    clientChunkUploadFailedRef.current = false;
     transcribedChunkIndexesRef.current.clear();
     failedChunkIndexesRef.current.clear();
   }

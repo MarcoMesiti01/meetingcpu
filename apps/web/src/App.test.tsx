@@ -182,15 +182,15 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
   });
 
-  it("finalizes an accepted session when recorder stop rejects after a chunk upload failure", async () => {
+  it("does not finalize a session as complete when recorder stop rejects after a chunk upload failure", async () => {
     const user = userEvent.setup();
+    const closeEvents = vi.fn();
     const api = createApi({
       uploadSessionChunk: vi.fn().mockRejectedValue(new Error("Chunk upload failed.")),
-      finalizeSession: vi.fn().mockResolvedValue({
-        sessionId: "session-1",
-        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
-        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
-        partial: true
+      finalizeSession: vi.fn(),
+      subscribeToSessionEvents: vi.fn((_sessionId, handlers) => {
+        api.lastEventHandlers = handlers;
+        return { close: closeEvents };
       })
     });
     const recorder = createRecorder({
@@ -207,10 +207,12 @@ describe("App", () => {
 
     await user.click(screen.getByRole("button", { name: "Stop and finalize" }));
 
-    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("session-1"));
+    await waitFor(() => expect(recorder.stop).toHaveBeenCalledTimes(1));
+    expect(api.finalizeSession).not.toHaveBeenCalled();
+    expect(closeEvents).toHaveBeenCalledTimes(1);
     expect(await screen.findByRole("alert")).toHaveTextContent("Chunk upload failed.");
     expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
-    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
+    expect(screen.queryByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).not.toBeInTheDocument();
   });
 
   it("does not duplicate transcript text for replayed chunk transcription events", async () => {
