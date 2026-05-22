@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createChunkSession,
   finalizeChunkSession,
@@ -79,6 +79,42 @@ describe("chunk session storage", () => {
     await expect(readJson(join(uploadSession.path, "metadata.json"))).resolves.toMatchObject({
       sourceType: "upload"
     });
+  });
+
+  it("removes the session directory when setup fails after the session is created", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const now = new Date("2026-05-18T13:30:00.000Z");
+    const sessionPath = join(root, "sessions", "2026-05-18-1330-setup-failure");
+    const setupError = new Error("cannot create in-progress transcript");
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async () => {
+      const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      return {
+        ...actual,
+        writeFile: async (...args: Parameters<typeof actual.writeFile>) => {
+          if (args[0].toString().endsWith("transcript.in-progress.txt")) {
+            throw setupError;
+          }
+          return await actual.writeFile(...args);
+        }
+      };
+    });
+
+    try {
+      const { createChunkSession: createFailingChunkSession } = await import("./chunkSessions.js");
+      await expect(
+        createFailingChunkSession({
+          dataRoot: root,
+          now,
+          title: "Setup Failure",
+          modelId: "small"
+        })
+      ).rejects.toThrow(setupError);
+      await expect(stat(sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
   });
 
   it("saves a chunk file and records timing, mime type, and size in the manifest", async () => {

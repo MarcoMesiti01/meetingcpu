@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import type { ModelId } from "./models.js";
 import { createSession, type Session, type SourceType } from "./sessions.js";
@@ -66,23 +66,28 @@ export async function createChunkSession(input: {
 }): Promise<ChunkSession> {
   const baseSession = await createSession({ dataRoot: input.dataRoot, now: input.now, title: input.title });
   const session = withChunkPaths(baseSession);
-  await mkdir(session.chunksPath, { recursive: true });
-  await mkdir(session.chunkResultsPath, { recursive: true });
-  await writeManifest(session, []);
-  await writeFile(session.inProgressTranscriptPath, "");
-  await writeMetadata(session, {
-    sessionId: session.id,
-    sourceType: input.sourceType ?? "microphone",
-    modelId: input.modelId,
-    status: "chunk-session-created",
-    chunksPath: session.chunksPath,
-    chunkResultsPath: session.chunkResultsPath,
-    manifestPath: session.manifestPath,
-    inProgressTranscriptPath: session.inProgressTranscriptPath,
-    lastCommittedEndSeconds: 0,
-    updatedAt: new Date().toISOString()
-  });
-  return session;
+  try {
+    await mkdir(session.chunksPath, { recursive: true });
+    await mkdir(session.chunkResultsPath, { recursive: true });
+    await writeManifest(session, []);
+    await writeFile(session.inProgressTranscriptPath, "");
+    await writeMetadata(session, {
+      sessionId: session.id,
+      sourceType: input.sourceType ?? "microphone",
+      modelId: input.modelId,
+      status: "chunk-session-created",
+      chunksPath: session.chunksPath,
+      chunkResultsPath: session.chunkResultsPath,
+      manifestPath: session.manifestPath,
+      inProgressTranscriptPath: session.inProgressTranscriptPath,
+      lastCommittedEndSeconds: 0,
+      updatedAt: new Date().toISOString()
+    });
+    return session;
+  } catch (error) {
+    await rm(session.path, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 export async function saveChunkFile(input: {
