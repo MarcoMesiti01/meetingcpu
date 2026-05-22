@@ -17,6 +17,12 @@ npm run dev
 
 `npm run dev` starts the browser app, the local Node API, and the local Python transcription service.
 
+## Live Chunking
+
+Microphone recordings are processed locally in 30-second chunks with a 5-second overlap. After each completed chunk is transcribed, the app saves `transcript.in-progress.txt` in the session folder so long meetings have a readable partial transcript while recording continues.
+
+When recording stops, the final transcript is assembled from the saved chunk results. The app does not retranscribe the full microphone recording at the end. Session chunk files are saved under `data/sessions/<id>/chunks`.
+
 ## Models
 
 The app exposes `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, and `distil-large-v3`. `small` is the default CPU-friendly model and is the only model downloaded by `npm install`. Larger models may be slow or fail on memory-limited laptops.
@@ -35,9 +41,26 @@ npm run download:model -- tiny base distil-large-v3
 
 The download step needs network access. After a model is present under `models/`, that model can be used offline.
 
+## Optional Speaker Labels
+
+Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the relevant pyannote model terms on Hugging Face, then run these commands in PowerShell:
+
+```bash
+npm install
+$env:HF_TOKEN="hf_your_token_here"
+npm run download:diarization
+npm run dev
+```
+
+The download step needs network access and a Hugging Face token with access to the accepted pyannote models. After the files are cached locally, diarization runs locally/offline from cache.
+
+If diarization is unavailable, missing, or not downloaded, transcription still runs without speaker labels. CPU laptops may find diarization slower than transcription.
+
 ## Saved Sessions
 
 Recordings and transcripts are saved under `data/sessions/`. This directory is intentionally ignored by git.
+
+Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
 ## Verification
 
