@@ -204,7 +204,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       session,
       modelId: modelResult.value,
       language: request.body.language ? String(request.body.language) : null,
-      diarization: parseBoolean(request.body.diarization),
+      diarization: parseBoolean(request.body.diarization, true),
       status: "recording",
       activeChunkUploads: 0,
       chunkUploadWaiters: [],
@@ -424,7 +424,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         modelId: modelResult.value,
         title: String(request.body.title ?? "local meeting"),
         language: request.body.language ? String(request.body.language) : null,
-        diarization: parseBoolean(request.body.diarization),
+        diarization: parseBoolean(request.body.diarization, true),
         cleanupUpload,
         resolveUploadFfmpegPath,
         splitUploadAudio,
@@ -789,7 +789,10 @@ function parseSourceType(value: unknown): SourceType {
   return value === "upload" ? "upload" : "microphone";
 }
 
-function parseBoolean(value: unknown): boolean {
+function parseBoolean(value: unknown, defaultValue = false): boolean {
+  if (value === undefined) {
+    return defaultValue;
+  }
   return value === true || value === "true" || value === "1";
 }
 

@@ -162,7 +162,7 @@ describe("server routes", () => {
     });
     const created = await request(app)
       .post("/api/sessions")
-      .send({ title: "Chunks", modelId: "small", language: "en", diarization: true })
+      .send({ title: "Chunks", modelId: "small", language: "en" })
       .expect(201);
     events.subscribe(created.body.sessionId, (event) => published.push(event));
 
@@ -191,7 +191,16 @@ describe("server routes", () => {
 
     const finalized = await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(200);
 
-    expect(transcribe).toHaveBeenCalledWith(
+    expect(transcribe).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        modelId: "small",
+        language: "en",
+        diarization: true
+      })
+    );
+    expect(transcribe).toHaveBeenNthCalledWith(
+      2,
       expect.objectContaining({
         modelId: "small",
         language: "en",
@@ -224,6 +233,30 @@ describe("server routes", () => {
       "Opening context.\nAccepted continuation.\n"
     );
     expect(finalized.body.partial).toBe(false);
+  });
+
+  it("keeps explicit false diarization disabled for live sessions", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockResolvedValue({
+      text: "No speakers.",
+      language: "en",
+      durationSeconds: 1,
+      segments: [{ start: 0, end: 1, text: "No speakers." }],
+      diarization: { available: false, enabled: false }
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe }
+    });
+    const created = await request(app)
+      .post("/api/sessions")
+      .send({ title: "No diarization", modelId: "small", diarization: false })
+      .expect(201);
+
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
+    await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(200);
+
+    expect(transcribe).toHaveBeenCalledWith(expect.objectContaining({ diarization: false }));
   });
 
   it("rejects late chunks while a session is finalizing", async () => {
@@ -790,6 +823,8 @@ describe("server routes", () => {
 
     expect(splitAudioIntoChunks).toHaveBeenCalled();
     expect(transcribe).toHaveBeenCalledTimes(2);
+    expect(transcribe).toHaveBeenNthCalledWith(1, expect.objectContaining({ diarization: true }));
+    expect(transcribe).toHaveBeenNthCalledWith(2, expect.objectContaining({ diarization: true }));
     expect(response.body.sessionId).toContain("upload");
     expect(response.body.sessionPath).toBe(join(dataRoot, "sessions", response.body.sessionId));
     expect(response.body.recordingPath).toBe(join(response.body.sessionPath, "upload.webm"));
