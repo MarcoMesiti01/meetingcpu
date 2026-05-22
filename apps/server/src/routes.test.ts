@@ -6,6 +6,7 @@ import { join } from "node:path";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createApp } from "./app.js";
+import { saveChunkFile as realSaveChunkFile } from "./chunkSessions.js";
 import type { RouteChunkSessionState } from "./routes.js";
 import { SessionEventHub } from "./sessionEvents.js";
 
@@ -824,11 +825,11 @@ describe("server routes", () => {
       })
     );
     expect(manifestTiming).toEqual([
-      { index: 0, startSeconds: 0, endSeconds: 30 },
-      { index: 1, startSeconds: 30, endSeconds: 35 }
+      { index: 1, startSeconds: 0, endSeconds: 30 },
+      { index: 2, startSeconds: 30, endSeconds: 35 }
     ]);
     expect(response.body.transcript.durationSeconds).toBe(35);
-    expect(response.body.transcript.chunks.map((chunk: { chunkIndex: number }) => chunk.chunkIndex)).toEqual([0, 1]);
+    expect(response.body.transcript.chunks.map((chunk: { chunkIndex: number }) => chunk.chunkIndex)).toEqual([1, 2]);
     await expect(readFile(response.body.transcriptJsonPath, "utf8")).resolves.toContain('"durationSeconds": 35');
   });
 
@@ -874,7 +875,7 @@ describe("server routes", () => {
 
     expect(saveChunkFile).toHaveBeenCalledWith(
       expect.objectContaining({
-        index: 0,
+        index: 1,
         startSeconds: 0,
         endSeconds: 30
       })
@@ -910,8 +911,8 @@ describe("server routes", () => {
       .expect(500);
 
     expect(response.body).toMatchObject({
-      code: "UPLOAD_CHUNKING_FAILED",
-      message: "Uploaded audio could not be split into transcription chunks."
+      code: "UPLOAD_CHUNK_SAVE_FAILED",
+      message: "Uploaded audio could not be saved as transcription chunks."
     });
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
     const metadata = JSON.parse(
@@ -920,8 +921,74 @@ describe("server routes", () => {
     expect(metadata).toMatchObject({
       status: "transcription-failed",
       error: {
-        code: "UPLOAD_CHUNKING_FAILED",
-        message: "Uploaded audio could not be split into transcription chunks."
+        code: "UPLOAD_CHUNK_SAVE_FAILED",
+        message: "Uploaded audio could not be saved as transcription chunks."
+      }
+    });
+  });
+
+  it("returns controlled JSON and records failure when the second uploaded chunk save fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPaths = [join(outputDirectory, "chunk-000000.webm"), join(outputDirectory, "chunk-000001.webm")];
+      await writeFile(chunkPaths[0], "first");
+      await writeFile(chunkPaths[1], "second");
+      return [
+        { index: 0, path: chunkPaths[0], startSeconds: 0, endSeconds: 30, durationSeconds: 30 },
+        { index: 1, path: chunkPaths[1], startSeconds: 30, endSeconds: 60, durationSeconds: 30 }
+      ];
+    });
+    const saveChunkFile = vi.fn(
+      async (input: Parameters<NonNullable<Parameters<typeof createApp>[0]["saveChunkFile"]>>[0]) => {
+        const { index } = input;
+        if (index === 2) {
+          throw new Error("chunk disk full");
+        }
+        return realSaveChunkFile(input);
+      }
+    );
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: {
+        health: vi.fn(),
+        transcribe: vi.fn(async ({ audioPath }: { audioPath: string }) => ({
+          text: (await readFile(audioPath, "utf8")).trim(),
+          language: "en",
+          durationSeconds: 1,
+          segments: [{ start: 0, end: 1, text: "first" }],
+          diarization: { available: false, enabled: false }
+        }))
+      },
+      saveChunkFile,
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Second save failure")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(500);
+
+    expect(saveChunkFile.mock.calls.map(([call]) => call.index)).toEqual([1, 2]);
+    expect(response.body).toMatchObject({
+      code: "UPLOAD_CHUNK_SAVE_FAILED",
+      message: "Uploaded audio could not be saved as transcription chunks."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(
+      await readFile(join(dataRoot, "sessions", response.body.sessionId, "metadata.json"), "utf8")
+    );
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      error: {
+        code: "UPLOAD_CHUNK_SAVE_FAILED",
+        message: "Uploaded audio could not be saved as transcription chunks."
       }
     });
   });
@@ -971,7 +1038,59 @@ describe("server routes", () => {
     expect(metadata).toMatchObject({
       status: "transcribed-partial",
       partial: true,
-      failedChunks: [{ chunkIndex: 1, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
+      failedChunks: [{ chunkIndex: 2, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
+    });
+  });
+
+  it("returns controlled JSON and records failure when upload transcript JSON cannot be read", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn(async ({ audioPath }: { audioPath: string }) => ({
+      text: (await readFile(audioPath, "utf8")).trim(),
+      language: "en",
+      durationSeconds: 1,
+      segments: [{ start: 0, end: 1, text: "Readable chunk" }],
+      diarization: { available: false, enabled: false }
+    }));
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPath = join(outputDirectory, "chunk-000000.webm");
+      await writeFile(chunkPath, "Readable chunk");
+      return [{ index: 0, path: chunkPath, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }];
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe },
+      readUploadTranscriptJson: vi.fn(async () => {
+        throw new Error("transcript json unavailable");
+      }),
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Read failure")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(500);
+
+    expect(response.body).toMatchObject({
+      code: "UPLOAD_TRANSCRIPT_READ_FAILED",
+      message: "Uploaded audio was transcribed, but the transcript could not be read."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(
+      await readFile(join(dataRoot, "sessions", response.body.sessionId, "metadata.json"), "utf8")
+    );
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      error: {
+        code: "UPLOAD_TRANSCRIPT_READ_FAILED",
+        message: "Uploaded audio was transcribed, but the transcript could not be read."
+      }
     });
   });
 
