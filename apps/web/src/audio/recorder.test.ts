@@ -418,6 +418,59 @@ describe("BrowserAudioRecorder", () => {
     vi.useRealTimers();
   });
 
+  it("drains pending chunk callbacks before rejecting after a scheduled recorder fails to start", async () => {
+    vi.useFakeTimers();
+    const stream = createStream();
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
+    const recorderCtor = createFakeMediaRecorder({
+      emitDataOnStart: false,
+      startErrorOnCall: 4,
+      startError: new Error("scheduled recorder failed")
+    });
+    let now = 0;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
+    const pendingChunk = createDeferred<void>();
+    const onChunk = vi.fn().mockReturnValueOnce(pendingChunk.promise);
+
+    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk });
+    const chunkRecorders = chunkRecorderInstances(recorderCtor);
+    chunkRecorders[0].emitAudio("first");
+
+    now += 1_500;
+    vi.advanceTimersByTime(1_500);
+    await Promise.resolve();
+    chunkRecorders[1].emitAudio("second");
+
+    now += 500;
+    vi.advanceTimersByTime(500);
+    await Promise.resolve();
+
+    expect(onChunk).toHaveBeenCalledTimes(1);
+
+    now += 1_000;
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+
+    const stopPromise = recorder.stop();
+    let stopRejected = false;
+    stopPromise.catch(() => {
+      stopRejected = true;
+    });
+    await Promise.resolve();
+
+    expect(stopRejected).toBe(false);
+
+    pendingChunk.resolve();
+
+    await expect(stopPromise).rejects.toThrow("scheduled recorder failed");
+    expect(stopRejected).toBe(true);
+    expect(stream.stop).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
   it("waits for pending chunk callbacks and the final stop chunk before resolving stop", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);

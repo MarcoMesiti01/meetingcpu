@@ -34,6 +34,7 @@ export class BrowserAudioRecorder {
   private nextChunkStartSeconds = 0;
   private chunkScheduleTimer: ReturnType<typeof setTimeout> | null = null;
   private activeChunkRecorders = new Set<ChunkRecorderState>();
+  private abortStopPromise: Promise<PromiseSettledResult<void>[]> | null = null;
 
   constructor(
     private readonly getUserMedia: GetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
@@ -58,6 +59,7 @@ export class BrowserAudioRecorder {
       this.chunkCallbackError = null;
       this.chunkRecordingStartedAtMs = 0;
       this.nextChunkStartSeconds = 0;
+      this.abortStopPromise = null;
 
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
@@ -93,6 +95,7 @@ export class BrowserAudioRecorder {
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
       this.nextChunkStartSeconds = 0;
+      this.abortStopPromise = null;
       this.chunkOptions = {
         ...timingOptions,
         onChunk: options.onChunk
@@ -252,7 +255,15 @@ export class BrowserAudioRecorder {
       this.emitChunkWindow(state, state.stopEndSeconds ?? state.plannedEndSeconds);
       state.resolveStop?.();
     };
-    recorder.start();
+    try {
+      recorder.start();
+    } catch (error) {
+      state.stopped = true;
+      this.activeChunkRecorders.delete(state);
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      throw error;
+    }
 
     state.stopTimer = setTimeout(() => {
       void this.stopChunkRecorder(state, state.plannedEndSeconds).catch((error) => {
@@ -286,13 +297,15 @@ export class BrowserAudioRecorder {
     const activeRecorders = [...this.activeChunkRecorders].sort((left, right) => left.startSeconds - right.startSeconds);
 
     try {
-      const stopResults = await Promise.allSettled([
-        this.stopFullRecorder(),
-        ...activeRecorders.map((state) => {
-          const endSeconds = Math.min(state.plannedEndSeconds, Math.max(state.startSeconds, elapsedSeconds));
-          return this.stopChunkRecorder(state, endSeconds);
-        })
-      ]);
+      const stopResults = this.abortStopPromise
+        ? await this.abortStopPromise
+        : await Promise.allSettled([
+            this.stopFullRecorder(),
+            ...activeRecorders.map((state) => {
+              const endSeconds = Math.min(state.plannedEndSeconds, Math.max(state.startSeconds, elapsedSeconds));
+              return this.stopChunkRecorder(state, endSeconds);
+            })
+          ]);
       await this.waitForPendingChunkCallbacks();
       const failedStop = stopResults.find((result) => result.status === "rejected");
       if (failedStop?.status === "rejected") {
@@ -367,20 +380,23 @@ export class BrowserAudioRecorder {
     this.chunkCallbackError = this.chunkCallbackError ?? error;
     this.clearChunkScheduleTimer();
     const activeRecorders = [...this.activeChunkRecorders];
+    const stopPromises = [
+      this.stopFullRecorder(),
+      ...activeRecorders.map((state) =>
+        this.stopChunkRecorder(state, state.stopEndSeconds ?? state.plannedEndSeconds)
+      )
+    ];
 
-    for (const state of activeRecorders) {
-      void this.stopChunkRecorder(state, state.stopEndSeconds ?? state.plannedEndSeconds).catch((stopError) => {
-        this.chunkCallbackError = this.chunkCallbackError ?? stopError;
-      });
-    }
-
-    try {
-      this.mediaRecorder?.stop();
-    } catch (stopError) {
-      this.chunkCallbackError = this.chunkCallbackError ?? stopError;
-    }
-
-    this.cleanupMedia();
+    this.abortStopPromise = Promise.allSettled(stopPromises);
+    void this.abortStopPromise.then((results) => {
+      for (const result of results) {
+        if (result.status === "rejected") {
+          this.chunkCallbackError = this.chunkCallbackError ?? result.reason;
+        }
+      }
+    });
+    this.stream?.getTracks().forEach((track) => track.stop());
+    this.stream = null;
   }
 
   private isRecording() {
@@ -414,6 +430,7 @@ export class BrowserAudioRecorder {
     this.chunkCallbackError = null;
     this.chunkRecordingStartedAtMs = 0;
     this.nextChunkStartSeconds = 0;
+    this.abortStopPromise = null;
   }
 }
 
