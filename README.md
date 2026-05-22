@@ -43,9 +43,9 @@ The download step needs network access. After a model is present under `models/`
 
 ## Optional Speaker Labels
 
-Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the relevant pyannote model terms on Hugging Face, then run these commands in PowerShell:
+Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the Hugging Face terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`, then run these commands in PowerShell:
 
-```bash
+```powershell
 npm install
 $env:HF_TOKEN="hf_your_token_here"
 npm run download:diarization
@@ -62,6 +62,8 @@ Recordings and transcripts are saved under `data/sessions/`. This directory is i
 
 Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
+On Windows, install ffmpeg and make sure `ffmpeg.exe` is available on `PATH`, or set `FFMPEG_PATH` to the full executable path.
+
 ## Verification
 
 Run the automated checks:
@@ -77,6 +79,6 @@ Start the local app:
 npm run dev
 ```
 
-Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `data/sessions/` with the original recording and transcript files.
+Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `data/sessions/` with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
 
 If these commands fail because local dependencies are missing, run `npm install` first. Installation needs network access for JavaScript dependencies, Python dependencies, and the model download; after dependencies and models are present, recording and transcription are intended to run locally/offline.
