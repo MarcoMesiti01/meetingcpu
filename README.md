@@ -21,7 +21,7 @@ npm run dev
 
 Microphone recordings are processed locally in 30-second chunks with a 5-second overlap. After each completed chunk is transcribed, the app saves `transcript.in-progress.txt` in the session folder so long meetings have a readable partial transcript while recording continues.
 
-When recording stops, the final transcript is assembled from the saved chunk results. The app does not retranscribe the full microphone recording at the end. Session chunk files are saved under `data/sessions/<id>/chunks`.
+When recording stops, the final transcript is assembled from the saved chunk results. The app does not retranscribe the full microphone recording at the end. Session chunk files are saved under `apps/server/data/sessions/<id>/chunks` by default. Set `MEETINGCPU_DATA_DIR` to use a different local data directory.
 
 ## Models
 
@@ -46,19 +46,19 @@ The download step needs network access. After a model is present under `models/`
 Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the Hugging Face terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`, then run these commands in PowerShell:
 
 ```powershell
-npm install
+npm.cmd install
 $env:HF_TOKEN="hf_your_token_here"
-npm run download:diarization
-npm run dev
+npm.cmd run download:diarization
+npm.cmd run dev
 ```
 
 The download step needs network access and a Hugging Face token with access to the accepted pyannote models. After the files are cached locally, diarization runs locally/offline from cache.
 
-If diarization is unavailable, missing, or not downloaded, transcription still runs without speaker labels. CPU laptops may find diarization slower than transcription.
+If diarization is unavailable, missing, or not downloaded, transcription still runs without speaker labels. Offline speaker labels require running the diarization download first. CPU laptops may find diarization slower than transcription.
 
 ## Saved Sessions
 
-Recordings and transcripts are saved under `data/sessions/`. This directory is intentionally ignored by git.
+Recordings and transcripts are saved under `apps/server/data/sessions/` by default. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
 
 Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
@@ -79,6 +79,6 @@ Start the local app:
 npm run dev
 ```
 
-Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `data/sessions/` with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
+Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `apps/server/data/sessions/` with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
 
 If these commands fail because local dependencies are missing, run `npm install` first. Installation needs network access for JavaScript dependencies, Python dependencies, and the model download; after dependencies and models are present, recording and transcription are intended to run locally/offline.
