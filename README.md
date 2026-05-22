@@ -4,7 +4,7 @@ A local-first meeting transcription tool for CPU-centered laptops.
 
 ## Goal
 
-The app records microphone audio in the browser, saves the recording locally, and transcribes it locally with faster-whisper. After installation and model download, transcription is designed to run offline.
+The app records microphone audio in the browser, saves local session artifacts, and transcribes locally with faster-whisper. After installation and model download, transcription is designed to run offline.
 
 ## Development Flow
 
@@ -58,7 +58,7 @@ If diarization is unavailable, missing, or not downloaded, transcription still r
 
 ## Saved Sessions
 
-Recordings and transcripts are saved under `apps/server/data/sessions/` by default. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
+Live microphone sessions save chunk audio files, in-progress transcripts, and final transcript files under `apps/server/data/sessions/` by default. The browser also returns the continuous full recording when recording stops. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
 
 Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
