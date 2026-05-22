@@ -138,12 +138,16 @@ export function createRoutes(dependencies: RouteDependencies): Router {
             diarization: input.diarization
           });
           const result = toChunkTranscriptResult(input.chunkIndex, transcript);
-          await saveChunkResult({ session: input.session, result });
+          const acceptedUpdate = await saveChunkResult({ session: input.session, result });
           events.publish({
             type: "chunk-transcribed",
             sessionId: input.sessionId,
             chunkIndex: input.chunkIndex,
-            text: result.text,
+            text: acceptedUpdate.acceptedText,
+            acceptedText: acceptedUpdate.acceptedText,
+            acceptedSegments: acceptedUpdate.acceptedSegments,
+            transcriptText: acceptedUpdate.transcriptText,
+            transcriptSegments: acceptedUpdate.transcriptSegments,
             diarization: result.diarization
           });
         } catch (error) {

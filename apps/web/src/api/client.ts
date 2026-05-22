@@ -57,6 +57,13 @@ export interface FinalizeSessionResponse {
   partial: boolean;
 }
 
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+  speaker?: string;
+}
+
 export type SessionEvent =
   | { type: "session-created"; sessionId: string; sessionPath: string; inProgressTranscriptPath: string }
   | { type: "chunk-saved"; sessionId: string; chunkIndex: number }
@@ -65,6 +72,10 @@ export type SessionEvent =
       sessionId: string;
       chunkIndex: number;
       text: string;
+      acceptedText?: string;
+      acceptedSegments?: TranscriptSegment[];
+      transcriptText?: string;
+      transcriptSegments?: TranscriptSegment[];
       diarization: { available: boolean; enabled: boolean; error?: string };
     }
   | { type: "chunk-failed"; sessionId: string; chunkIndex: number; code: string; message: string }

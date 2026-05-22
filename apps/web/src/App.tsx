@@ -4,6 +4,7 @@ import {
   type ModelOption,
   type SessionEvent,
   type SessionEventConnection,
+  type TranscriptSegment,
   type createApiClient
 } from "./api/client";
 import type { RecordedAudioChunk, StartChunkedRecordingOptions } from "./audio/recorder";
@@ -284,7 +285,15 @@ export default function App({ api, recorder }: AppProps) {
       transcribedChunkIndexesRef.current.add(event.chunkIndex);
       setTranscribedChunkCount((count) => Math.max(count, event.chunkIndex));
       setDiarizationStatus(formatDiarizationStatus(event.diarization));
-      setTranscriptGroups((groups) => mergeTranscriptGroups(groups, event.text, event.chunkIndex));
+      setTranscriptGroups((groups) => {
+        if (event.transcriptSegments && event.transcriptSegments.length > 0) {
+          return transcriptGroupsFromSegments(event.transcriptSegments, `transcript-${event.chunkIndex}`);
+        }
+        if (event.acceptedSegments && event.acceptedSegments.length > 0) {
+          return mergeTranscriptSegmentGroups(groups, event.acceptedSegments, `chunk-${event.chunkIndex}`);
+        }
+        return mergeTranscriptGroups(groups, event.text, event.chunkIndex);
+      });
       return;
     }
 
@@ -509,6 +518,41 @@ function mergeTranscriptGroups(groups: TranscriptGroup[], text: string, chunkInd
   return nextGroups;
 }
 
+function mergeTranscriptSegmentGroups(
+  groups: TranscriptGroup[],
+  segments: TranscriptSegment[],
+  idPrefix: string
+): TranscriptGroup[] {
+  const segmentGroups = transcriptGroupsFromSegments(segments, idPrefix);
+  if (segmentGroups.length === 0) return groups;
+
+  const nextGroups = [...groups];
+  for (const group of segmentGroups) {
+    const previous = nextGroups.at(-1);
+    if (previous && previous.speaker === group.speaker) {
+      nextGroups[nextGroups.length - 1] = {
+        ...previous,
+        text: `${previous.text}\n${group.text}`
+      };
+    } else {
+      nextGroups.push(group);
+    }
+  }
+  return nextGroups;
+}
+
+function transcriptGroupsFromSegments(segments: TranscriptSegment[], idPrefix: string): TranscriptGroup[] {
+  return [...segments]
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+    .map((segment, index) => ({
+      id: `${idPrefix}-${index}-${segment.start}-${segment.end}`,
+      speaker: normalizeSpeaker(segment.speaker),
+      timestamp: formatSegmentTimestamp(segment.start),
+      text: segment.text.trim()
+    }))
+    .filter((group) => group.text.length > 0);
+}
+
 function parseTranscriptText(text: string, chunkIndex: number): TranscriptGroup[] {
   return text
     .split(/\r?\n/)
@@ -533,6 +577,14 @@ function normalizeSpeaker(speaker?: string) {
   if (!speaker) return "Speaker 1";
   const match = speaker.match(/speaker\s+(\d+)/i);
   return match ? `Speaker ${match[1]}` : speaker;
+}
+
+function formatSegmentTimestamp(seconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainingSeconds = totalSeconds % 60;
+  return [hours, minutes, remainingSeconds].map((part) => part.toString().padStart(2, "0")).join(":");
 }
 
 function formatDiarizationStatus(diarization: { available: boolean; enabled: boolean; error?: string }) {

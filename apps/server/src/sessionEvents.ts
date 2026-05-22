@@ -6,6 +6,10 @@ export type SessionEvent =
       sessionId: string;
       chunkIndex: number;
       text: string;
+      acceptedText?: string;
+      acceptedSegments?: Array<{ start: number; end: number; text: string; speaker?: string }>;
+      transcriptText?: string;
+      transcriptSegments?: Array<{ start: number; end: number; text: string; speaker?: string }>;
       diarization: { available: boolean; enabled: boolean; error?: string };
     }
   | { type: "chunk-failed"; sessionId: string; chunkIndex: number; code: string; message: string }

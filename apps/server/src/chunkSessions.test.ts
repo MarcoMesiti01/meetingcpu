@@ -211,7 +211,7 @@ describe("chunk session storage", () => {
       }
     });
 
-    await saveChunkResult({
+    const update = await saveChunkResult({
       session,
       result: {
         chunkIndex: 2,
@@ -224,6 +224,22 @@ describe("chunk session storage", () => {
           { start: 16, end: 18, text: "New line." }
         ]
       }
+    });
+
+    expect(update).toEqual({
+      acceptedSegments: [{ start: 16, end: 18, text: "New line." }],
+      acceptedText: "[00:00:16] New line.\n",
+      transcriptSegments: [
+        { start: 0, end: 4, text: "Old overlap.", speaker: "Speaker 1" },
+        { start: 5, end: 8, text: "Hello there.", speaker: "Speaker 1" },
+        { start: 12, end: 14, text: "No speaker." },
+        { start: 16, end: 18, text: "New line." }
+      ],
+      transcriptText:
+        "[00:00:00] Speaker 1: Old overlap.\n" +
+        "[00:00:05] Speaker 1: Hello there.\n" +
+        "[00:00:12] No speaker.\n" +
+        "[00:00:16] New line.\n"
     });
 
     const resultPath = join(session.chunkResultsPath, "chunk-000001.json");

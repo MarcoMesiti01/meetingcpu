@@ -246,6 +246,36 @@ describe("App", () => {
     expect(screen.getByText("Chunks transcribed").closest(".metric")).toHaveTextContent("1");
   });
 
+  it("renders live transcript events from accepted segment data instead of parsing raw text", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    await act(async () => {
+      emitEvent(api.lastEventHandlers, {
+        type: "chunk-transcribed",
+        sessionId: "session-1",
+        chunkIndex: 1,
+        text: "Speaker 1: duplicated overlap\nSpeaker 1: misleading raw text",
+        diarization: { available: true, enabled: true },
+        acceptedSegments: [
+          { start: 0, end: 4, text: "Accepted opening.", speaker: "Speaker A" },
+          { start: 5, end: 8, text: "Accepted reply.", speaker: "Speaker B" }
+        ]
+      });
+    });
+
+    expect(await screen.findByText("Speaker A")).toBeInTheDocument();
+    expect(screen.getByText("Speaker B")).toBeInTheDocument();
+    expect(screen.getByText("Accepted opening.")).toBeInTheDocument();
+    expect(screen.getByText("Accepted reply.")).toBeInTheDocument();
+    expect(screen.queryByText("misleading raw text")).not.toBeInTheDocument();
+  });
+
   it("ignores live events for a different session", async () => {
     const user = userEvent.setup();
     const api = createApi();

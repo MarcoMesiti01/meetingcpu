@@ -135,14 +135,26 @@ describe("server routes", () => {
   it("saves uploaded chunks, enqueues transcription, and finalizes the transcript", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const events = new SessionEventHub();
-    const published: string[] = [];
-    const transcribe = vi.fn().mockResolvedValue({
-      text: "Hello chunk.",
-      language: "en",
-      durationSeconds: 2,
-      segments: [{ start: 0, end: 2, text: "Hello chunk.", speaker: "Speaker 1" }],
-      diarization: { available: true, enabled: true }
-    });
+    const published: unknown[] = [];
+    const transcribe = vi
+      .fn()
+      .mockResolvedValueOnce({
+        text: "Opening context.",
+        language: "en",
+        durationSeconds: 10,
+        segments: [{ start: 0, end: 10, text: "Opening context.", speaker: "Speaker 1" }],
+        diarization: { available: true, enabled: true }
+      })
+      .mockResolvedValueOnce({
+        text: "Opening context.\nAccepted continuation.",
+        language: "en",
+        durationSeconds: 10,
+        segments: [
+          { start: 0, end: 2, text: "Opening context.", speaker: "Speaker 1" },
+          { start: 3, end: 8, text: "Accepted continuation.", speaker: "Speaker 2" }
+        ],
+        diarization: { available: true, enabled: true }
+      });
     const app = createApp({
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
@@ -152,15 +164,23 @@ describe("server routes", () => {
       .post("/api/sessions")
       .send({ title: "Chunks", modelId: "small", language: "en", diarization: true })
       .expect(201);
-    events.subscribe(created.body.sessionId, (event) => published.push(event.type));
+    events.subscribe(created.body.sessionId, (event) => published.push(event));
 
     const chunkResponse = await request(app)
       .post(`/api/sessions/${created.body.sessionId}/chunks`)
       .field("chunkIndex", "1")
       .field("startSeconds", "0")
-      .field("endSeconds", "2")
+      .field("endSeconds", "10")
       .field("overlapSeconds", "0")
-      .attach("audio", Buffer.from("chunk-audio"), "chunk.webm")
+      .attach("audio", Buffer.from("chunk-audio-1"), "chunk-1.webm")
+      .expect(202);
+    await request(app)
+      .post(`/api/sessions/${created.body.sessionId}/chunks`)
+      .field("chunkIndex", "2")
+      .field("startSeconds", "8")
+      .field("endSeconds", "18")
+      .field("overlapSeconds", "2")
+      .attach("audio", Buffer.from("chunk-audio-2"), "chunk-2.webm")
       .expect(202);
 
     expect(chunkResponse.body).toEqual({
@@ -178,11 +198,31 @@ describe("server routes", () => {
         diarization: true
       })
     );
-    expect(published).toEqual(expect.arrayContaining(["chunk-saved", "chunk-transcribed", "session-finalized"]));
-    await expect(readFile(created.body.inProgressTranscriptPath, "utf8")).resolves.toBe(
-      "[00:00:00] Speaker 1: Hello chunk.\n"
+    expect(published).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "chunk-saved" }),
+        expect.objectContaining({ type: "chunk-transcribed" }),
+        expect.objectContaining({ type: "session-finalized" })
+      ])
     );
-    await expect(readFile(finalized.body.transcriptPath, "utf8")).resolves.toBe("Hello chunk.\n");
+    expect(published).toContainEqual(
+      expect.objectContaining({
+        type: "chunk-transcribed",
+        chunkIndex: 2,
+        text: "[00:00:11] Speaker 2: Accepted continuation.\n",
+        acceptedSegments: [{ start: 11, end: 16, text: "Accepted continuation.", speaker: "Speaker 2" }],
+        transcriptSegments: [
+          { start: 0, end: 10, text: "Opening context.", speaker: "Speaker 1" },
+          { start: 11, end: 16, text: "Accepted continuation.", speaker: "Speaker 2" }
+        ]
+      })
+    );
+    await expect(readFile(created.body.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:00] Speaker 1: Opening context.\n[00:00:11] Speaker 2: Accepted continuation.\n"
+    );
+    await expect(readFile(finalized.body.transcriptPath, "utf8")).resolves.toBe(
+      "Opening context.\nAccepted continuation.\n"
+    );
     expect(finalized.body.partial).toBe(false);
   });
 

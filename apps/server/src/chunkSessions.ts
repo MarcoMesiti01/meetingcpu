@@ -45,6 +45,13 @@ export interface ChunkTranscriptResult {
   diarization: ChunkDiarizationStatus;
 }
 
+export interface ChunkAcceptedTranscriptUpdate {
+  acceptedSegments: ChunkTranscriptSegment[];
+  acceptedText: string;
+  transcriptSegments: ChunkTranscriptSegment[];
+  transcriptText: string;
+}
+
 interface ChunkFailure {
   chunkIndex: number;
   code: string;
@@ -128,8 +135,11 @@ export async function saveChunkFile(input: {
   });
 }
 
-export async function saveChunkResult(input: { session: ChunkSession; result: ChunkTranscriptResult }): Promise<void> {
-  await withSessionMutation(input.session, async () => {
+export async function saveChunkResult(input: {
+  session: ChunkSession;
+  result: ChunkTranscriptResult;
+}): Promise<ChunkAcceptedTranscriptUpdate> {
+  return withSessionMutation(input.session, async () => {
     await mkdir(input.session.chunkResultsPath, { recursive: true });
     const manifest = await readManifest(input.session);
     const manifestEntry = requireManifestEntry(manifest, input.result.chunkIndex);
@@ -142,20 +152,31 @@ export async function saveChunkResult(input: { session: ChunkSession; result: Ch
       (result) => result.chunkIndex !== input.result.chunkIndex
     );
     const acceptedResults = applyAcceptedSegments([...existingResults, storedResult]);
+    const acceptedTranscriptSegments = acceptedSegments(acceptedResults);
+    const resultAcceptedSegments =
+      acceptedResults.find((result) => result.chunkIndex === input.result.chunkIndex)?.acceptedSegments ?? [];
 
     await Promise.all(
       acceptedResults.map((result) => writeJsonAtomic(resultPath(input.session, result.chunkIndex), result))
     );
     await writeManifest(input.session, setManifestStatus(manifest, input.result.chunkIndex, "transcribed"));
-    await writeFile(input.session.inProgressTranscriptPath, transcriptText(acceptedSegments(acceptedResults), true));
+    const formattedTranscriptText = transcriptText(acceptedTranscriptSegments, true);
+    await writeFile(input.session.inProgressTranscriptPath, formattedTranscriptText);
 
     const metadata = await readMetadata(input.session);
     const status = readFailures(metadata).length > 0 ? "chunk-transcribing-partial" : "chunk-transcribing";
     await writeMetadata(input.session, {
       status,
-      lastCommittedEndSeconds: maxSegmentEnd(acceptedSegments(acceptedResults)),
+      lastCommittedEndSeconds: maxSegmentEnd(acceptedTranscriptSegments),
       updatedAt: new Date().toISOString()
     });
+
+    return {
+      acceptedSegments: resultAcceptedSegments,
+      acceptedText: transcriptText(resultAcceptedSegments, true),
+      transcriptSegments: acceptedTranscriptSegments,
+      transcriptText: formattedTranscriptText
+    };
   });
 }
 
