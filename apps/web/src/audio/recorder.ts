@@ -31,11 +31,9 @@ export class BrowserAudioRecorder {
   private pendingChunkCallbacks = new Set<Promise<void>>();
   private chunkCallbackError: unknown = null;
   private chunkRecordingStartedAtMs = 0;
-  private lastSliceEndSeconds = 0;
-  private sliceBuffer: RecordedAudioSlice[] = [];
-  private recorderSliceSeconds = 0;
   private nextChunkStartSeconds = 0;
-  private nextChunkEndSeconds = 0;
+  private chunkScheduleTimer: ReturnType<typeof setTimeout> | null = null;
+  private activeChunkRecorders = new Set<ChunkRecorderState>();
 
   constructor(
     private readonly getUserMedia: GetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
@@ -44,7 +42,7 @@ export class BrowserAudioRecorder {
   ) {}
 
   async start(): Promise<void> {
-    if (this.startInProgress || this.mediaRecorder) {
+    if (this.startInProgress || this.isRecording()) {
       throw new Error("Recording is already in progress.");
     }
 
@@ -59,11 +57,7 @@ export class BrowserAudioRecorder {
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
       this.chunkRecordingStartedAtMs = 0;
-      this.lastSliceEndSeconds = 0;
-      this.sliceBuffer = [];
-      this.recorderSliceSeconds = 0;
       this.nextChunkStartSeconds = 0;
-      this.nextChunkEndSeconds = 0;
 
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
@@ -84,7 +78,7 @@ export class BrowserAudioRecorder {
   }
 
   async startChunked(options: StartChunkedRecordingOptions): Promise<void> {
-    if (this.startInProgress || this.mediaRecorder) {
+    if (this.startInProgress || this.isRecording()) {
       throw new Error("Recording is already in progress.");
     }
 
@@ -97,8 +91,6 @@ export class BrowserAudioRecorder {
       this.nextChunkIndex = 1;
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
-      this.lastSliceEndSeconds = 0;
-      this.sliceBuffer = [];
       this.nextChunkStartSeconds = 0;
       const chunkSeconds = options.chunkSeconds ?? DEFAULT_CHUNK_SECONDS;
       const overlapSeconds = options.overlapSeconds ?? (
@@ -109,17 +101,10 @@ export class BrowserAudioRecorder {
         overlapSeconds,
         onChunk: options.onChunk
       };
-      this.nextChunkEndSeconds = chunkSeconds;
 
-      const mediaRecorder = new this.MediaRecorderCtor(stream);
-      this.mediaRecorder = mediaRecorder;
-      mediaRecorder.ondataavailable = (event) => {
-        this.trackChunkedData(event.data);
-      };
       this.chunkRecordingStartedAtMs = this.now();
-      const recorderSliceMilliseconds = sliceMilliseconds(chunkSeconds, overlapSeconds);
-      this.recorderSliceSeconds = recorderSliceMilliseconds / 1000;
-      mediaRecorder.start(recorderSliceMilliseconds);
+      this.startChunkRecorder(0);
+      this.scheduleNextChunkRecorder();
     } catch (error) {
       this.reset();
       throw error;
@@ -129,6 +114,10 @@ export class BrowserAudioRecorder {
   }
 
   async stop(): Promise<Blob> {
+    if (this.chunkOptions) {
+      return this.stopChunkedRecording();
+    }
+
     if (!this.mediaRecorder) {
       if (this.chunkCallbackError) {
         const error = this.chunkCallbackError;
@@ -143,7 +132,6 @@ export class BrowserAudioRecorder {
       recorder.onstop = () => {
         void (async () => {
           try {
-            this.flushFinalChunkWindow();
             await this.waitForPendingChunkCallbacks();
             if (this.chunkCallbackError) {
               throw this.chunkCallbackError;
@@ -163,7 +151,6 @@ export class BrowserAudioRecorder {
       } catch (error) {
         void (async () => {
           try {
-            this.flushFinalChunkWindow();
             await this.waitForPendingChunkCallbacks();
           } finally {
             this.reset();
@@ -172,19 +159,6 @@ export class BrowserAudioRecorder {
         })();
       }
     });
-  }
-
-  private trackChunkedData(blob: Blob) {
-    const pending = this.handleChunkedData(blob).catch((error) => {
-      this.chunkCallbackError = this.chunkCallbackError ?? error;
-      throw error;
-    });
-    this.pendingChunkCallbacks.add(pending);
-    pending.then(
-      () => this.pendingChunkCallbacks.delete(pending),
-      () => this.pendingChunkCallbacks.delete(pending)
-    );
-    pending.catch(() => undefined);
   }
 
   private async waitForPendingChunkCallbacks() {
@@ -198,60 +172,19 @@ export class BrowserAudioRecorder {
     }
   }
 
-  private async handleChunkedData(blob: Blob) {
-    if (blob.size <= 0 || !this.chunkOptions) {
-      return;
-    }
-
-    this.chunks.push(blob);
-    const sliceStartSeconds = this.lastSliceEndSeconds;
-    const elapsedSeconds = Math.max(0, (this.now() - this.chunkRecordingStartedAtMs) / 1000);
-    const sliceEndSeconds = Math.max(sliceStartSeconds + this.recorderSliceSeconds, elapsedSeconds);
-    this.lastSliceEndSeconds = sliceEndSeconds;
-    this.sliceBuffer.push({ startSeconds: sliceStartSeconds, endSeconds: sliceEndSeconds, blob });
-
-    this.flushCompleteChunkWindows();
-  }
-
-  private flushCompleteChunkWindows() {
-    while (this.chunkOptions && this.lastSliceEndSeconds >= this.nextChunkEndSeconds) {
-      this.emitChunkWindow(this.nextChunkStartSeconds, this.nextChunkEndSeconds);
-      this.advanceChunkWindow();
-    }
-  }
-
-  private flushFinalChunkWindow() {
-    if (!this.chunkOptions || this.sliceBuffer.length === 0 || this.lastSliceEndSeconds <= this.nextChunkStartSeconds) {
-      return;
-    }
-    if (
-      this.nextChunkIndex > 1 &&
-      this.lastSliceEndSeconds <= this.nextChunkStartSeconds + this.chunkOptions.overlapSeconds
-    ) {
-      return;
-    }
-
-    this.emitChunkWindow(this.nextChunkStartSeconds, this.lastSliceEndSeconds);
-    this.advanceChunkWindow();
-  }
-
-  private emitChunkWindow(startSeconds: number, endSeconds: number) {
+  private emitChunkWindow(state: ChunkRecorderState, endSeconds: number) {
     if (!this.chunkOptions) {
       return;
     }
 
-    const windowSlices = this.sliceBuffer.filter((slice) => (
-      slice.endSeconds > startSeconds && slice.startSeconds < endSeconds
-    ));
-    if (windowSlices.length === 0) {
+    if (state.chunks.length === 0) {
       return;
     }
 
-    const chunkIndex = this.nextChunkIndex;
-    this.nextChunkIndex += 1;
-    const blobParts = windowSlices.map((slice) => slice.blob);
-    const mimeType = windowSlices[0]?.blob.type || DEFAULT_MIME_TYPE;
-    const blob = new Blob(blobParts, { type: mimeType });
+    const chunkIndex = state.chunkIndex;
+    const startSeconds = state.startSeconds;
+    const mimeType = state.chunks[0]?.type || DEFAULT_MIME_TYPE;
+    const blob = new Blob(state.chunks, { type: mimeType });
     const fileExtension = extensionForMimeType(mimeType);
     const overlapSeconds = effectiveOverlapSeconds(
       chunkIndex,
@@ -281,15 +214,131 @@ export class BrowserAudioRecorder {
     pending.catch(() => undefined);
   }
 
-  private advanceChunkWindow() {
+  private startChunkRecorder(startSeconds: number) {
+    if (!this.stream || !this.chunkOptions) {
+      return;
+    }
+
+    const recorder = new this.MediaRecorderCtor(this.stream);
+    const state: ChunkRecorderState = {
+      recorder,
+      chunkIndex: this.nextChunkIndex,
+      startSeconds,
+      plannedEndSeconds: startSeconds + this.chunkOptions.chunkSeconds,
+      chunks: [],
+      stopTimer: null,
+      stopPromise: null,
+      stopped: false
+    };
+    this.nextChunkIndex += 1;
+    this.activeChunkRecorders.add(state);
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        state.chunks.push(event.data);
+        this.chunks.push(event.data);
+      }
+    };
+    recorder.onstop = () => {
+      state.stopped = true;
+      this.clearChunkStopTimer(state);
+      this.activeChunkRecorders.delete(state);
+      this.emitChunkWindow(state, state.stopEndSeconds ?? state.plannedEndSeconds);
+      state.resolveStop?.();
+    };
+    recorder.start();
+
+    state.stopTimer = setTimeout(() => {
+      void this.stopChunkRecorder(state, state.plannedEndSeconds).catch((error) => {
+        this.chunkCallbackError = this.chunkCallbackError ?? error;
+      });
+    }, Math.max(1, Math.round(this.chunkOptions.chunkSeconds * 1000)));
+  }
+
+  private scheduleNextChunkRecorder() {
     if (!this.chunkOptions) {
       return;
     }
 
     const hopSeconds = cadenceSeconds(this.chunkOptions.chunkSeconds, this.chunkOptions.overlapSeconds);
     this.nextChunkStartSeconds += hopSeconds;
-    this.nextChunkEndSeconds += hopSeconds;
-    this.sliceBuffer = this.sliceBuffer.filter((slice) => slice.endSeconds > this.nextChunkStartSeconds);
+    this.chunkScheduleTimer = setTimeout(() => {
+      this.chunkScheduleTimer = null;
+      try {
+        this.startChunkRecorder(this.nextChunkStartSeconds);
+        this.scheduleNextChunkRecorder();
+      } catch (error) {
+        this.chunkCallbackError = this.chunkCallbackError ?? error;
+      }
+    }, Math.max(1, Math.round(hopSeconds * 1000)));
+  }
+
+  private async stopChunkedRecording(): Promise<Blob> {
+    this.clearChunkScheduleTimer();
+    const elapsedSeconds = Math.max(0, (this.now() - this.chunkRecordingStartedAtMs) / 1000);
+    const activeRecorders = [...this.activeChunkRecorders].sort((left, right) => left.startSeconds - right.startSeconds);
+
+    try {
+      const stopResults = await Promise.allSettled(activeRecorders.map((state) => {
+        const endSeconds = Math.min(state.plannedEndSeconds, Math.max(state.startSeconds, elapsedSeconds));
+        return this.stopChunkRecorder(state, endSeconds);
+      }));
+      await this.waitForPendingChunkCallbacks();
+      const failedStop = stopResults.find((result) => result.status === "rejected");
+      if (failedStop?.status === "rejected") {
+        throw failedStop.reason;
+      }
+      if (this.chunkCallbackError) {
+        throw this.chunkCallbackError;
+      }
+      const chunks = this.chunks;
+      const type = chunks[0]?.type || DEFAULT_MIME_TYPE;
+      this.reset();
+      return new Blob(chunks, { type });
+    } catch (error) {
+      this.reset();
+      throw normalizeError(error);
+    }
+  }
+
+  private stopChunkRecorder(state: ChunkRecorderState, endSeconds: number): Promise<void> {
+    if (state.stopped) {
+      return state.stopPromise ?? Promise.resolve();
+    }
+    state.stopEndSeconds = endSeconds;
+    if (!state.stopPromise) {
+      state.stopPromise = new Promise((resolve, reject) => {
+        state.resolveStop = resolve;
+        state.rejectStop = reject;
+      });
+    }
+    this.clearChunkStopTimer(state);
+    try {
+      state.recorder.stop();
+    } catch (error) {
+      state.stopped = true;
+      this.activeChunkRecorders.delete(state);
+      state.rejectStop?.(error);
+    }
+    return state.stopPromise;
+  }
+
+  private clearChunkScheduleTimer() {
+    if (this.chunkScheduleTimer !== null) {
+      clearTimeout(this.chunkScheduleTimer);
+      this.chunkScheduleTimer = null;
+    }
+  }
+
+  private clearChunkStopTimer(state: ChunkRecorderState) {
+    if (state.stopTimer !== null) {
+      clearTimeout(state.stopTimer);
+      state.stopTimer = null;
+    }
+  }
+
+  private isRecording() {
+    return this.mediaRecorder !== null || this.chunkOptions !== null;
   }
 
   private cleanupMedia() {
@@ -297,6 +346,13 @@ export class BrowserAudioRecorder {
       this.mediaRecorder.ondataavailable = null;
       this.mediaRecorder.onstop = null;
     }
+    this.clearChunkScheduleTimer();
+    this.activeChunkRecorders.forEach((state) => {
+      this.clearChunkStopTimer(state);
+      state.recorder.ondataavailable = null;
+      state.recorder.onstop = null;
+    });
+    this.activeChunkRecorders.clear();
     this.stream?.getTracks().forEach((track) => track.stop());
     this.mediaRecorder = null;
     this.stream = null;
@@ -311,18 +367,22 @@ export class BrowserAudioRecorder {
     this.pendingChunkCallbacks.clear();
     this.chunkCallbackError = null;
     this.chunkRecordingStartedAtMs = 0;
-    this.lastSliceEndSeconds = 0;
-    this.sliceBuffer = [];
-    this.recorderSliceSeconds = 0;
     this.nextChunkStartSeconds = 0;
-    this.nextChunkEndSeconds = 0;
   }
 }
 
-interface RecordedAudioSlice {
+interface ChunkRecorderState {
+  recorder: MediaRecorder;
+  chunkIndex: number;
   startSeconds: number;
-  endSeconds: number;
-  blob: Blob;
+  plannedEndSeconds: number;
+  chunks: Blob[];
+  stopTimer: ReturnType<typeof setTimeout> | null;
+  stopPromise: Promise<void> | null;
+  resolveStop?: () => void;
+  rejectStop?: (reason?: unknown) => void;
+  stopEndSeconds?: number;
+  stopped: boolean;
 }
 
 function normalizeError(error: unknown): Error {
@@ -344,23 +404,6 @@ function extensionForMimeType(mimeType: string): string {
 
 function cadenceSeconds(chunkSeconds: number, overlapSeconds: number): number {
   return Math.max(0.001, chunkSeconds - overlapSeconds);
-}
-
-function sliceMilliseconds(chunkSeconds: number, overlapSeconds: number): number {
-  const chunkMilliseconds = Math.max(1, Math.round(chunkSeconds * 1000));
-  const cadenceMilliseconds = Math.max(1, Math.round(cadenceSeconds(chunkSeconds, overlapSeconds) * 1000));
-  return gcd(chunkMilliseconds, cadenceMilliseconds);
-}
-
-function gcd(left: number, right: number): number {
-  let a = Math.abs(left);
-  let b = Math.abs(right);
-  while (b > 0) {
-    const remainder = a % b;
-    a = b;
-    b = remainder;
-  }
-  return Math.max(1, a);
 }
 
 function effectiveOverlapSeconds(

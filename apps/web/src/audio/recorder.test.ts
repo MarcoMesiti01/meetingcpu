@@ -1,7 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
-import { BrowserAudioRecorder } from "./recorder";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { BrowserAudioRecorder, type RecordedAudioChunk } from "./recorder";
 
 describe("BrowserAudioRecorder", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("requests microphone access and returns a webm blob when stopped", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
@@ -150,21 +154,38 @@ describe("BrowserAudioRecorder", () => {
   });
 
   it("emits true overlapping 30 second chunks with 5 second default overlap", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, mimeType: "audio/webm;codecs=opus" });
-    let now = 1_000;
+    let now = 0;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const chunks: RecordedAudioChunk[] = [];
 
     await recorder.startChunked({ onChunk: (chunk) => chunks.push(chunk) });
-    const instance = recorderCtor.instances[0];
-    for (let second = 5; second <= 55; second += 5) {
-      now = 1_000 + second * 1000;
-      instance.emitAudio(`[${second - 5}-${second}]`);
-    }
+    const firstRecorder = recorderCtor.instances[0];
+    firstRecorder.emitAudio("recorder-1 audio");
 
-    expect(instance.startCalls).toEqual([5000]);
+    now += 25_000;
+    vi.advanceTimersByTime(25_000);
+    await Promise.resolve();
+    const secondRecorder = recorderCtor.instances[1];
+    secondRecorder.emitAudio("recorder-2 audio");
+
+    firstRecorder.emitAudio(" late/coalesced recorder-1 audio");
+    now += 5_000;
+    vi.advanceTimersByTime(5_000);
+    await Promise.resolve();
+
+    now += 25_000;
+    vi.advanceTimersByTime(25_000);
+    await Promise.resolve();
+
+    expect(recorderCtor.instances).toHaveLength(3);
+    expect(firstRecorder.startCalls).toEqual([undefined]);
+    expect(secondRecorder.startCalls).toEqual([undefined]);
+    expect(firstRecorder.stopCalls).toBe(1);
+    expect(secondRecorder.stopCalls).toBe(1);
     expect(chunks).toMatchObject([
       {
         chunkIndex: 1,
@@ -185,43 +206,63 @@ describe("BrowserAudioRecorder", () => {
         fileName: "chunk-000002.webm"
       }
     ]);
-    expect(await readBlobAsText(chunks[0].blob)).toBe("[0-5][5-10][10-15][15-20][20-25][25-30]");
-    expect(await readBlobAsText(chunks[1].blob)).toBe("[25-30][30-35][35-40][40-45][45-50][50-55]");
 
     await recorder.stop();
+    vi.useRealTimers();
+    expect(await readBlobAsText(chunks[0].blob)).toBe("recorder-1 audio late/coalesced recorder-1 audio");
+    expect(await readBlobAsText(chunks[1].blob)).toBe("recorder-2 audio");
     expect(chunks).toHaveLength(2);
   });
 
   it("uses configurable chunk and overlap windows", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
-    let now = 1_000;
+    let now = 0;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const chunks: RecordedAudioChunk[] = [];
 
     await recorder.startChunked({ chunkSeconds: 4, overlapSeconds: 1, onChunk: (chunk) => chunks.push(chunk) });
-    const instance = recorderCtor.instances[0];
-    for (let second = 1; second <= 7; second += 1) {
-      now = 1_000 + second * 1000;
-      instance.emitAudio(`[${second - 1}-${second}]`);
-    }
+    recorderCtor.instances[0].emitAudio("first");
 
-    expect(instance.startCalls).toEqual([1000]);
+    now += 3_000;
+    vi.advanceTimersByTime(3_000);
+    await Promise.resolve();
+    recorderCtor.instances[1].emitAudio("second");
+
+    now += 1_000;
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+
+    now += 2_000;
+    vi.advanceTimersByTime(2_000);
+    await Promise.resolve();
+    recorderCtor.instances[2].emitAudio("third");
+
+    now += 1_000;
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+
+    expect(recorderCtor.instances).toHaveLength(3);
+    expect(recorderCtor.instances.map((instance) => instance.startCalls)).toEqual([[undefined], [undefined], [undefined]]);
+    expect(recorderCtor.instances.map((instance) => instance.stopCalls)).toEqual([1, 1, 0]);
     expect(chunks).toMatchObject([
       { chunkIndex: 1, startSeconds: 0, endSeconds: 4, overlapSeconds: 0 },
       { chunkIndex: 2, startSeconds: 3, endSeconds: 7, overlapSeconds: 1 }
     ]);
-    expect(await readBlobAsText(chunks[0].blob)).toBe("[0-1][1-2][2-3][3-4]");
-    expect(await readBlobAsText(chunks[1].blob)).toBe("[3-4][4-5][5-6][6-7]");
     await recorder.stop();
+    vi.useRealTimers();
+    expect(await readBlobAsText(chunks[0].blob)).toBe("first");
+    expect(await readBlobAsText(chunks[1].blob)).toBe("second");
   });
 
   it("flushes a final partial overlapping window on stop", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
-    let now = 1_000;
+    let now = 0;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const chunks: RecordedAudioChunk[] = [];
 
@@ -230,19 +271,24 @@ describe("BrowserAudioRecorder", () => {
       overlapSeconds: 1,
       onChunk: (chunk) => chunks.push(chunk)
     });
-    const instance = recorderCtor.instances[0];
-    for (let second = 1; second <= 5; second += 1) {
-      now = 1_000 + second * 1000;
-      instance.emitAudio(`[${second - 1}-${second}]`);
-    }
+    recorderCtor.instances[0].emitAudio("first");
+    now += 3_000;
+    vi.advanceTimersByTime(3_000);
+    await Promise.resolve();
+    recorderCtor.instances[1].emitAudio("second partial");
+    now += 1_500;
+    vi.advanceTimersByTime(1_500);
+    await Promise.resolve();
     await recorder.stop();
 
     expect(chunks).toHaveLength(2);
     expect(chunks).toMatchObject([
       { chunkIndex: 1, startSeconds: 0, endSeconds: 4, overlapSeconds: 0 },
-      { chunkIndex: 2, startSeconds: 3, endSeconds: 5, overlapSeconds: 1 }
+      { chunkIndex: 2, startSeconds: 3, endSeconds: 4.5, overlapSeconds: 1 }
     ]);
-    expect(await readBlobAsText(chunks[1].blob)).toBe("[3-4][4-5]");
+    expect(recorderCtor.instances.map((instance) => instance.stopCalls)).toEqual([1, 1]);
+    vi.useRealTimers();
+    expect(await readBlobAsText(chunks[1].blob)).toBe("second partial");
   });
 
   it("preserves the full chunked recording on stop", async () => {
@@ -268,11 +314,8 @@ describe("BrowserAudioRecorder", () => {
       emitDataOnStop: true
     });
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
-    const firstChunk = createDeferred<void>();
     const finalChunk = createDeferred<void>();
-    const onChunk = vi.fn()
-      .mockReturnValueOnce(firstChunk.promise)
-      .mockReturnValueOnce(finalChunk.promise);
+    const onChunk = vi.fn().mockReturnValueOnce(finalChunk.promise);
 
     await recorder.startChunked({ chunkSeconds: 2, onChunk });
     recorderCtor.instances[0].emitAudio("first");
@@ -284,11 +327,7 @@ describe("BrowserAudioRecorder", () => {
     });
     await Promise.resolve();
 
-    expect(onChunk).toHaveBeenCalledTimes(2);
-    expect(stopResolved).toBe(false);
-
-    firstChunk.resolve();
-    await Promise.resolve();
+    expect(onChunk).toHaveBeenCalledTimes(1);
     expect(stopResolved).toBe(false);
 
     finalChunk.resolve();
@@ -309,10 +348,10 @@ describe("BrowserAudioRecorder", () => {
     await recorder.startChunked({ chunkSeconds: 2, onChunk });
     recorderCtor.instances[0].emitBlob(new Blob([], { type: "audio/webm" }));
     recorderCtor.instances[0].emitAudio("non-empty");
+    await recorder.stop();
 
     expect(onChunk).toHaveBeenCalledTimes(1);
     expect(onChunk.mock.calls[0][0].chunkIndex).toBe(1);
-    await recorder.stop();
   });
 
   it("guards overlapping single-blob and chunked starts", async () => {
@@ -347,10 +386,12 @@ describe("BrowserAudioRecorder", () => {
   });
 
   it("waits for all pending chunk callbacks before rejecting stop when one fails", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
-    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    let now = 0;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const failedChunk = createDeferred<void>();
     const slowChunk = createDeferred<void>();
     const uploadError = new Error("upload failed");
@@ -358,9 +399,15 @@ describe("BrowserAudioRecorder", () => {
       .mockReturnValueOnce(failedChunk.promise)
       .mockReturnValueOnce(slowChunk.promise);
 
-    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk });
     recorderCtor.instances[0].emitAudio("first");
-    recorderCtor.instances[0].emitAudio("second");
+    now += 1_500;
+    vi.advanceTimersByTime(1_500);
+    await Promise.resolve();
+    recorderCtor.instances[1].emitAudio("second");
+    now += 500;
+    vi.advanceTimersByTime(500);
+    await Promise.resolve();
 
     const stopPromise = recorder.stop();
     let stopRejected = false;
@@ -370,7 +417,7 @@ describe("BrowserAudioRecorder", () => {
     await Promise.resolve();
 
     failedChunk.reject(uploadError);
-    await waitForAsyncTurn();
+    await Promise.resolve();
 
     expect(stopRejected).toBe(false);
 
@@ -382,13 +429,15 @@ describe("BrowserAudioRecorder", () => {
   });
 
   it("waits for a pending rejection and final stop chunk before rejecting stop", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({
       emitDataOnStart: false,
       emitDataOnStop: true
     });
-    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    let now = 0;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const failedChunk = createDeferred<void>();
     const finalChunk = createDeferred<void>();
     const uploadError = new Error("upload failed");
@@ -396,8 +445,15 @@ describe("BrowserAudioRecorder", () => {
       .mockReturnValueOnce(failedChunk.promise)
       .mockReturnValueOnce(finalChunk.promise);
 
-    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk });
     recorderCtor.instances[0].emitAudio("first");
+    now += 1_500;
+    vi.advanceTimersByTime(1_500);
+    await Promise.resolve();
+    recorderCtor.instances[1].emitAudio("second");
+    now += 500;
+    vi.advanceTimersByTime(500);
+    await Promise.resolve();
 
     const stopPromise = recorder.stop();
     let stopRejected = false;
@@ -409,7 +465,7 @@ describe("BrowserAudioRecorder", () => {
     expect(onChunk).toHaveBeenCalledTimes(2);
 
     failedChunk.reject(uploadError);
-    await waitForAsyncTurn();
+    await Promise.resolve();
 
     expect(stopRejected).toBe(false);
 
@@ -421,25 +477,35 @@ describe("BrowserAudioRecorder", () => {
   });
 
   it("waits for pending chunk callbacks before rejecting when recorder stop throws", async () => {
+    vi.useFakeTimers();
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({
       emitDataOnStart: false,
+      stopErrorOnCall: 2,
       stopError: new Error("stop failed")
     });
-    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor);
+    let now = 0;
+    const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
     const pendingChunk = createDeferred<void>();
     const onChunk = vi.fn().mockReturnValue(pendingChunk.promise);
 
-    await recorder.startChunked({ chunkSeconds: 2, onChunk });
+    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk });
     recorderCtor.instances[0].emitAudio("first");
+    now += 1_500;
+    vi.advanceTimersByTime(1_500);
+    await Promise.resolve();
+    recorderCtor.instances[1].emitAudio("second");
+    now += 500;
+    vi.advanceTimersByTime(500);
+    await Promise.resolve();
 
     const stopPromise = recorder.stop();
     let stopRejected = false;
     stopPromise.catch(() => {
       stopRejected = true;
     });
-    await waitForAsyncTurn();
+    await Promise.resolve();
 
     expect(stopRejected).toBe(false);
     expect(onChunk).toHaveBeenCalledTimes(1);
@@ -493,6 +559,7 @@ function createFakeMediaRecorder(options: {
   startError?: Error;
   startErrorOnce?: Error;
   stopError?: Error;
+  stopErrorOnCall?: number;
 } = {}) {
   const {
     emitDataOnStart = true,
@@ -500,15 +567,18 @@ function createFakeMediaRecorder(options: {
     mimeType = "audio/webm",
     startError,
     startErrorOnce,
-    stopError
+    stopError,
+    stopErrorOnCall
   } = options;
   let hasThrownStartErrorOnce = false;
+  let stopCallCount = 0;
 
   class FakeMediaRecorder {
     static instances: FakeMediaRecorder[] = [];
     ondataavailable: ((event: { data: Blob }) => void) | null = null;
     onstop: (() => void) | null = null;
     startCalls: Array<number | undefined> = [];
+    stopCalls = 0;
 
     constructor(public stream: MediaStream) {
       FakeMediaRecorder.instances.push(this);
@@ -525,7 +595,11 @@ function createFakeMediaRecorder(options: {
     }
 
     stop() {
-      if (stopError) throw stopError;
+      this.stopCalls += 1;
+      stopCallCount += 1;
+      if (stopError && (stopErrorOnCall === undefined || stopCallCount === stopErrorOnCall)) {
+        throw stopError;
+      }
       if (emitDataOnStop) this.emitAudio();
       this.onstop?.();
     }
