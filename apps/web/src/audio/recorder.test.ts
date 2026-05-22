@@ -149,29 +149,27 @@ describe("BrowserAudioRecorder", () => {
     expect(blob.type).toBe("audio/webm");
   });
 
-  it("starts chunked recording with overlap cadence and emits clock-based chunk metadata", async () => {
+  it("emits true overlapping 30 second chunks with 5 second default overlap", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, mimeType: "audio/webm;codecs=opus" });
     let now = 1_000;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
-    const chunks: unknown[] = [];
+    const chunks: RecordedAudioChunk[] = [];
 
-    await recorder.startChunked({ chunkSeconds: 2, overlapSeconds: 0.5, onChunk: (chunk) => chunks.push(chunk) });
+    await recorder.startChunked({ onChunk: (chunk) => chunks.push(chunk) });
     const instance = recorderCtor.instances[0];
-    now = 2_250;
-    instance.emitAudio("first");
-    now = 4_750;
-    instance.emitAudio("second");
+    for (let second = 5; second <= 55; second += 5) {
+      now = 1_000 + second * 1000;
+      instance.emitAudio(`[${second - 5}-${second}]`);
+    }
 
-    expect(instance.startCalls).toEqual([1500]);
-    expect(chunks[0]).toHaveProperty("blob");
-    expect(await readBlobAsText((chunks[0] as { blob: Blob }).blob)).toBe("first");
+    expect(instance.startCalls).toEqual([5000]);
     expect(chunks).toMatchObject([
       {
         chunkIndex: 1,
         startSeconds: 0,
-        endSeconds: 1.25,
+        endSeconds: 30,
         overlapSeconds: 0,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
@@ -179,61 +177,72 @@ describe("BrowserAudioRecorder", () => {
       },
       {
         chunkIndex: 2,
-        startSeconds: 1.25,
-        endSeconds: 3.75,
-        overlapSeconds: 0.5,
+        startSeconds: 25,
+        endSeconds: 55,
+        overlapSeconds: 5,
         mimeType: "audio/webm;codecs=opus",
         fileExtension: "webm",
         fileName: "chunk-000002.webm"
       }
     ]);
+    expect(await readBlobAsText(chunks[0].blob)).toBe("[0-5][5-10][10-15][15-20][20-25][25-30]");
+    expect(await readBlobAsText(chunks[1].blob)).toBe("[25-30][30-35][35-40][40-45][45-50][50-55]");
 
     await recorder.stop();
+    expect(chunks).toHaveLength(2);
   });
 
-  it("uses a 25 second overlap cadence by default for chunked recording", async () => {
+  it("uses configurable chunk and overlap windows", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
     const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
     let now = 1_000;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
-    const onChunk = vi.fn();
+    const chunks: RecordedAudioChunk[] = [];
 
-    await recorder.startChunked({ onChunk });
-    now = 31_000;
-    recorderCtor.instances[0].emitAudio("first");
-    now = 61_000;
-    recorderCtor.instances[0].emitAudio("second");
+    await recorder.startChunked({ chunkSeconds: 4, overlapSeconds: 1, onChunk: (chunk) => chunks.push(chunk) });
+    const instance = recorderCtor.instances[0];
+    for (let second = 1; second <= 7; second += 1) {
+      now = 1_000 + second * 1000;
+      instance.emitAudio(`[${second - 1}-${second}]`);
+    }
 
-    expect(recorderCtor.instances[0].startCalls).toEqual([25_000]);
-    expect(onChunk).toHaveBeenNthCalledWith(1, expect.objectContaining({ overlapSeconds: 0 }));
-    expect(onChunk).toHaveBeenNthCalledWith(2, expect.objectContaining({ overlapSeconds: 5 }));
+    expect(instance.startCalls).toEqual([1000]);
+    expect(chunks).toMatchObject([
+      { chunkIndex: 1, startSeconds: 0, endSeconds: 4, overlapSeconds: 0 },
+      { chunkIndex: 2, startSeconds: 3, endSeconds: 7, overlapSeconds: 1 }
+    ]);
+    expect(await readBlobAsText(chunks[0].blob)).toBe("[0-1][1-2][2-3][3-4]");
+    expect(await readBlobAsText(chunks[1].blob)).toBe("[3-4][4-5][5-6][6-7]");
     await recorder.stop();
   });
 
-  it("clamps overlap metadata below each non-initial chunk duration", async () => {
+  it("flushes a final partial overlapping window on stop", async () => {
     const stream = createStream();
     const getUserMedia = vi.fn().mockResolvedValue(stream);
-    const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false, emitDataOnStop: true });
+    const recorderCtor = createFakeMediaRecorder({ emitDataOnStart: false });
     let now = 1_000;
     const recorder = new BrowserAudioRecorder(getUserMedia, recorderCtor, () => now);
-    const chunks: Array<{ overlapSeconds: number; startSeconds: number; endSeconds: number }> = [];
+    const chunks: RecordedAudioChunk[] = [];
 
     await recorder.startChunked({
-      chunkSeconds: 30,
-      overlapSeconds: 5,
+      chunkSeconds: 4,
+      overlapSeconds: 1,
       onChunk: (chunk) => chunks.push(chunk)
     });
-    now = 31_000;
-    recorderCtor.instances[0].emitAudio("normal");
-    now = 32_000;
+    const instance = recorderCtor.instances[0];
+    for (let second = 1; second <= 5; second += 1) {
+      now = 1_000 + second * 1000;
+      instance.emitAudio(`[${second - 1}-${second}]`);
+    }
     await recorder.stop();
 
     expect(chunks).toHaveLength(2);
-    expect(chunks[0]).toMatchObject({ startSeconds: 0, endSeconds: 30, overlapSeconds: 0 });
-    expect(chunks[1].endSeconds - chunks[1].startSeconds).toBe(1);
-    expect(chunks[1].overlapSeconds).toBeGreaterThanOrEqual(0);
-    expect(chunks[1].overlapSeconds).toBeLessThan(chunks[1].endSeconds - chunks[1].startSeconds);
+    expect(chunks).toMatchObject([
+      { chunkIndex: 1, startSeconds: 0, endSeconds: 4, overlapSeconds: 0 },
+      { chunkIndex: 2, startSeconds: 3, endSeconds: 5, overlapSeconds: 1 }
+    ]);
+    expect(await readBlobAsText(chunks[1].blob)).toBe("[3-4][4-5]");
   });
 
   it("preserves the full chunked recording on stop", async () => {

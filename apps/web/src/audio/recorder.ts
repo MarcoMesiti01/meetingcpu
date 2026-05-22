@@ -31,7 +31,11 @@ export class BrowserAudioRecorder {
   private pendingChunkCallbacks = new Set<Promise<void>>();
   private chunkCallbackError: unknown = null;
   private chunkRecordingStartedAtMs = 0;
-  private lastChunkEndSeconds = 0;
+  private lastSliceEndSeconds = 0;
+  private sliceBuffer: RecordedAudioSlice[] = [];
+  private recorderSliceSeconds = 0;
+  private nextChunkStartSeconds = 0;
+  private nextChunkEndSeconds = 0;
 
   constructor(
     private readonly getUserMedia: GetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices),
@@ -55,7 +59,11 @@ export class BrowserAudioRecorder {
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
       this.chunkRecordingStartedAtMs = 0;
-      this.lastChunkEndSeconds = 0;
+      this.lastSliceEndSeconds = 0;
+      this.sliceBuffer = [];
+      this.recorderSliceSeconds = 0;
+      this.nextChunkStartSeconds = 0;
+      this.nextChunkEndSeconds = 0;
 
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
@@ -89,14 +97,19 @@ export class BrowserAudioRecorder {
       this.nextChunkIndex = 1;
       this.pendingChunkCallbacks.clear();
       this.chunkCallbackError = null;
-      this.lastChunkEndSeconds = 0;
+      this.lastSliceEndSeconds = 0;
+      this.sliceBuffer = [];
+      this.nextChunkStartSeconds = 0;
       const chunkSeconds = options.chunkSeconds ?? DEFAULT_CHUNK_SECONDS;
-      const overlapSeconds = options.overlapSeconds ?? DEFAULT_OVERLAP_SECONDS;
+      const overlapSeconds = options.overlapSeconds ?? (
+        options.chunkSeconds === undefined ? DEFAULT_OVERLAP_SECONDS : 0
+      );
       this.chunkOptions = {
         chunkSeconds,
         overlapSeconds,
         onChunk: options.onChunk
       };
+      this.nextChunkEndSeconds = chunkSeconds;
 
       const mediaRecorder = new this.MediaRecorderCtor(stream);
       this.mediaRecorder = mediaRecorder;
@@ -104,7 +117,9 @@ export class BrowserAudioRecorder {
         this.trackChunkedData(event.data);
       };
       this.chunkRecordingStartedAtMs = this.now();
-      mediaRecorder.start(cadenceMilliseconds(chunkSeconds, overlapSeconds));
+      const recorderSliceMilliseconds = sliceMilliseconds(chunkSeconds, overlapSeconds);
+      this.recorderSliceSeconds = recorderSliceMilliseconds / 1000;
+      mediaRecorder.start(recorderSliceMilliseconds);
     } catch (error) {
       this.reset();
       throw error;
@@ -128,6 +143,7 @@ export class BrowserAudioRecorder {
       recorder.onstop = () => {
         void (async () => {
           try {
+            this.flushFinalChunkWindow();
             await this.waitForPendingChunkCallbacks();
             if (this.chunkCallbackError) {
               throw this.chunkCallbackError;
@@ -147,6 +163,7 @@ export class BrowserAudioRecorder {
       } catch (error) {
         void (async () => {
           try {
+            this.flushFinalChunkWindow();
             await this.waitForPendingChunkCallbacks();
           } finally {
             this.reset();
@@ -186,27 +203,93 @@ export class BrowserAudioRecorder {
       return;
     }
 
+    this.chunks.push(blob);
+    const sliceStartSeconds = this.lastSliceEndSeconds;
+    const elapsedSeconds = Math.max(0, (this.now() - this.chunkRecordingStartedAtMs) / 1000);
+    const sliceEndSeconds = Math.max(sliceStartSeconds + this.recorderSliceSeconds, elapsedSeconds);
+    this.lastSliceEndSeconds = sliceEndSeconds;
+    this.sliceBuffer.push({ startSeconds: sliceStartSeconds, endSeconds: sliceEndSeconds, blob });
+
+    this.flushCompleteChunkWindows();
+  }
+
+  private flushCompleteChunkWindows() {
+    while (this.chunkOptions && this.lastSliceEndSeconds >= this.nextChunkEndSeconds) {
+      this.emitChunkWindow(this.nextChunkStartSeconds, this.nextChunkEndSeconds);
+      this.advanceChunkWindow();
+    }
+  }
+
+  private flushFinalChunkWindow() {
+    if (!this.chunkOptions || this.sliceBuffer.length === 0 || this.lastSliceEndSeconds <= this.nextChunkStartSeconds) {
+      return;
+    }
+    if (
+      this.nextChunkIndex > 1 &&
+      this.lastSliceEndSeconds <= this.nextChunkStartSeconds + this.chunkOptions.overlapSeconds
+    ) {
+      return;
+    }
+
+    this.emitChunkWindow(this.nextChunkStartSeconds, this.lastSliceEndSeconds);
+    this.advanceChunkWindow();
+  }
+
+  private emitChunkWindow(startSeconds: number, endSeconds: number) {
+    if (!this.chunkOptions) {
+      return;
+    }
+
+    const windowSlices = this.sliceBuffer.filter((slice) => (
+      slice.endSeconds > startSeconds && slice.startSeconds < endSeconds
+    ));
+    if (windowSlices.length === 0) {
+      return;
+    }
+
     const chunkIndex = this.nextChunkIndex;
     this.nextChunkIndex += 1;
-    this.chunks.push(blob);
-
-    const elapsedSeconds = Math.max(0, (this.now() - this.chunkRecordingStartedAtMs) / 1000);
-    const startSeconds = this.lastChunkEndSeconds;
-    const endSeconds = Math.max(startSeconds, elapsedSeconds);
-    this.lastChunkEndSeconds = endSeconds;
-    const mimeType = blob.type || DEFAULT_MIME_TYPE;
+    const blobParts = windowSlices.map((slice) => slice.blob);
+    const mimeType = windowSlices[0]?.blob.type || DEFAULT_MIME_TYPE;
+    const blob = new Blob(blobParts, { type: mimeType });
     const fileExtension = extensionForMimeType(mimeType);
-
-    await this.chunkOptions.onChunk({
+    const overlapSeconds = effectiveOverlapSeconds(
       chunkIndex,
       startSeconds,
       endSeconds,
-      overlapSeconds: effectiveOverlapSeconds(chunkIndex, startSeconds, endSeconds, this.chunkOptions.overlapSeconds),
+      this.chunkOptions.overlapSeconds
+    );
+
+    const pending = Promise.resolve(this.chunkOptions.onChunk({
+      chunkIndex,
+      startSeconds,
+      endSeconds,
+      overlapSeconds,
       blob,
       mimeType,
       fileExtension,
       fileName: `chunk-${chunkIndex.toString().padStart(6, "0")}.${fileExtension}`
+    })).catch((error) => {
+      this.chunkCallbackError = this.chunkCallbackError ?? error;
+      throw error;
     });
+    this.pendingChunkCallbacks.add(pending);
+    pending.then(
+      () => this.pendingChunkCallbacks.delete(pending),
+      () => this.pendingChunkCallbacks.delete(pending)
+    );
+    pending.catch(() => undefined);
+  }
+
+  private advanceChunkWindow() {
+    if (!this.chunkOptions) {
+      return;
+    }
+
+    const hopSeconds = cadenceSeconds(this.chunkOptions.chunkSeconds, this.chunkOptions.overlapSeconds);
+    this.nextChunkStartSeconds += hopSeconds;
+    this.nextChunkEndSeconds += hopSeconds;
+    this.sliceBuffer = this.sliceBuffer.filter((slice) => slice.endSeconds > this.nextChunkStartSeconds);
   }
 
   private cleanupMedia() {
@@ -228,8 +311,18 @@ export class BrowserAudioRecorder {
     this.pendingChunkCallbacks.clear();
     this.chunkCallbackError = null;
     this.chunkRecordingStartedAtMs = 0;
-    this.lastChunkEndSeconds = 0;
+    this.lastSliceEndSeconds = 0;
+    this.sliceBuffer = [];
+    this.recorderSliceSeconds = 0;
+    this.nextChunkStartSeconds = 0;
+    this.nextChunkEndSeconds = 0;
   }
+}
+
+interface RecordedAudioSlice {
+  startSeconds: number;
+  endSeconds: number;
+  blob: Blob;
 }
 
 function normalizeError(error: unknown): Error {
@@ -249,8 +342,25 @@ function extensionForMimeType(mimeType: string): string {
   return "webm";
 }
 
-function cadenceMilliseconds(chunkSeconds: number, overlapSeconds: number): number {
-  return Math.max(1, (chunkSeconds - overlapSeconds) * 1000);
+function cadenceSeconds(chunkSeconds: number, overlapSeconds: number): number {
+  return Math.max(0.001, chunkSeconds - overlapSeconds);
+}
+
+function sliceMilliseconds(chunkSeconds: number, overlapSeconds: number): number {
+  const chunkMilliseconds = Math.max(1, Math.round(chunkSeconds * 1000));
+  const cadenceMilliseconds = Math.max(1, Math.round(cadenceSeconds(chunkSeconds, overlapSeconds) * 1000));
+  return gcd(chunkMilliseconds, cadenceMilliseconds);
+}
+
+function gcd(left: number, right: number): number {
+  let a = Math.abs(left);
+  let b = Math.abs(right);
+  while (b > 0) {
+    const remainder = a % b;
+    a = b;
+    b = remainder;
+  }
+  return Math.max(1, a);
 }
 
 function effectiveOverlapSeconds(
