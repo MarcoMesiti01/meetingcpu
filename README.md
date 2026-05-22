@@ -6,12 +6,22 @@ A local-first meeting transcription tool for CPU-centered laptops.
 
 The app records microphone audio in the browser, saves local session artifacts, and transcribes locally with faster-whisper. After installation and model download, transcription is designed to run offline.
 
+## Prerequisites
+
+- Node.js 20 or newer
+- Python 3.9 or newer
+- Network access for the first install and model downloads
+- Optional: ffmpeg for uploaded audio transcription
+- Optional: Hugging Face token with accepted pyannote terms for speaker labels
+
 ## Development Flow
 
 ```bash
 npm install
 npm run dev
 ```
+
+In PowerShell environments where `npm.ps1` is blocked by execution policy, use `npm.cmd install` and `npm.cmd run dev`.
 
 `npm install` installs JavaScript dependencies, creates a local Python virtual environment, installs the faster-whisper service dependencies, and downloads the default `small` model.
 
@@ -58,7 +68,7 @@ If diarization is unavailable, missing, or not downloaded, transcription still r
 
 ## Saved Sessions
 
-Live microphone sessions save chunk audio files, in-progress transcripts, and final transcript files under `apps/server/data/sessions/` by default. The browser also returns the continuous full recording when recording stops. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
+Live microphone sessions save chunk audio files, in-progress transcripts, and final transcript files under `apps/server/data/sessions/` by default. The continuous full recording is available in the browser when recording stops, but it is not saved under the server session folder. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
 
 Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
