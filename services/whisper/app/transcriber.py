@@ -14,7 +14,7 @@ class LocalTranscriber:
         self._models = {}
         self.diarizer = diarizer if diarizer is not None else self._create_diarizer()
 
-    def transcribe(self, audio_path, model_id, language):
+    def transcribe(self, audio_path, model_id, language, diarization=True):
         option = get_model_option(model_id)
         if option is None:
             raise ValueError(f"Unknown model: {model_id}")
@@ -51,13 +51,16 @@ class LocalTranscriber:
                 f"Audio file could not be decoded: {audio_path}. {error}"
             ) from error
         text = " ".join(segment["text"] for segment in segment_list).strip()
-        diarization = self._apply_diarization(audio_path, segment_list)
+        if diarization:
+            diarization_status = self._apply_diarization(audio_path, segment_list)
+        else:
+            diarization_status = self._disabled_diarization(segment_list)
         return {
             "text": text,
             "language": info.language,
             "durationSeconds": info.duration,
             "segments": segment_list,
-            "diarization": diarization,
+            "diarization": diarization_status,
         }
 
     def _create_diarizer(self):
@@ -109,6 +112,11 @@ class LocalTranscriber:
             }
 
         return {"available": True, "enabled": True}
+
+    def _disabled_diarization(self, segment_list):
+        for segment in segment_list:
+            segment["speaker"] = "Speaker 1"
+        return {"available": False, "enabled": False}
 
     def diarization_status(self):
         fallback = {

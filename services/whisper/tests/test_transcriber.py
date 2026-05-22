@@ -40,6 +40,20 @@ class AvailableDiarizer:
         return [{"start": 0, "end": 1.0, "speaker": "Speaker 1"}]
 
 
+class SpyDiarizer:
+    def __init__(self):
+        self.available_calls = 0
+        self.diarize_calls = 0
+
+    def is_available(self):
+        self.available_calls += 1
+        return True
+
+    def diarize(self, audio_path):
+        self.diarize_calls += 1
+        return [{"start": 0, "end": 1.0, "speaker": "Speaker 1"}]
+
+
 class OffsetDiarizer:
     def __init__(self, turns):
         self.turns = turns
@@ -118,6 +132,37 @@ def test_transcriber_returns_chunk_shape_with_fake_diarization(tmp_path):
         ],
         "diarization": {"available": True, "enabled": True},
     }
+
+
+def test_transcriber_skips_diarizer_when_diarization_disabled(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    diarizer = SpyDiarizer()
+    transcriber = LocalTranscriber(diarizer=diarizer)
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None, diarization=False)
+
+    assert diarizer.available_calls == 0
+    assert diarizer.diarize_calls == 0
+    assert result["segments"] == [
+        {"start": 0, "end": 1.0, "text": "Hello", "speaker": "Speaker 1"}
+    ]
+    assert result["diarization"] == {"available": False, "enabled": False}
+
+
+def test_transcriber_uses_diarizer_by_default(tmp_path):
+    audio_path = tmp_path / "recording.webm"
+    audio_path.write_bytes(b"fake audio")
+    diarizer = SpyDiarizer()
+    transcriber = LocalTranscriber(diarizer=diarizer)
+    transcriber._load_model = lambda model_id, compute_type: GoodModel()
+
+    result = transcriber.transcribe(str(audio_path), "small", None)
+
+    assert diarizer.available_calls == 1
+    assert diarizer.diarize_calls == 1
+    assert result["diarization"] == {"available": True, "enabled": True}
 
 
 def test_transcriber_returns_diarization_fallback_when_unavailable(tmp_path):

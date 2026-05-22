@@ -11,6 +11,7 @@ class TranscribeRequest(BaseModel):
     audioPath: str
     modelId: str
     language: Optional[str] = None
+    diarization: bool = True
 
 
 def create_default_transcriber():
@@ -81,7 +82,10 @@ def create_app(transcriber=None, health_diarizer=None):
 
         try:
             return get_active_transcriber().transcribe(
-                request.audioPath, request.modelId, request.language
+                request.audioPath,
+                request.modelId,
+                request.language,
+                request.diarization,
             )
         except RuntimeError as error:
             raise HTTPException(

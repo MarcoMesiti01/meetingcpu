@@ -5,10 +5,21 @@ from app.main import create_app
 
 
 class FakeTranscriber:
+    def __init__(self):
+        self.calls = []
+
     def diarization_status(self):
         return {"available": True, "enabled": True}
 
-    def transcribe(self, audio_path, model_id, language):
+    def transcribe(self, audio_path, model_id, language, diarization=True):
+        self.calls.append(
+            {
+                "audio_path": audio_path,
+                "model_id": model_id,
+                "language": language,
+                "diarization": diarization,
+            }
+        )
         return {
             "text": "Hello from Python.",
             "language": language or "en",
@@ -29,7 +40,7 @@ class FailingTranscriber:
     def __init__(self, error):
         self.error = error
 
-    def transcribe(self, audio_path, model_id, language):
+    def transcribe(self, audio_path, model_id, language, diarization=True):
         raise self.error
 
 
@@ -112,7 +123,8 @@ def test_health_endpoint_reports_diarization_without_loading_transcriber(monkeyp
 
 
 def test_transcribe_endpoint_returns_transcript():
-    client = TestClient(create_app(FakeTranscriber()))
+    transcriber = FakeTranscriber()
+    client = TestClient(create_app(transcriber))
     response = client.post(
         "/transcribe",
         json={"audioPath": "recording.webm", "modelId": "small", "language": None},
@@ -132,6 +144,38 @@ def test_transcribe_endpoint_returns_transcript():
         ],
         "diarization": {"available": True, "enabled": True},
     }
+    assert transcriber.calls == [
+        {
+            "audio_path": "recording.webm",
+            "model_id": "small",
+            "language": None,
+            "diarization": True,
+        }
+    ]
+
+
+def test_transcribe_endpoint_forwards_disabled_diarization():
+    transcriber = FakeTranscriber()
+    client = TestClient(create_app(transcriber))
+    response = client.post(
+        "/transcribe",
+        json={
+            "audioPath": "recording.webm",
+            "modelId": "small",
+            "language": "en",
+            "diarization": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert transcriber.calls == [
+        {
+            "audio_path": "recording.webm",
+            "model_id": "small",
+            "language": "en",
+            "diarization": False,
+        }
+    ]
 
 
 def test_transcribe_endpoint_rejects_unknown_model():
