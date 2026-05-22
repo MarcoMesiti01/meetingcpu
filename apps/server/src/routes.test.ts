@@ -848,12 +848,8 @@ describe("server routes", () => {
       await writeFile(chunkPath, "Injected saver");
       return [{ index: 0, path: chunkPath, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }];
     });
-    const saveChunkFile = vi.fn(
-      async ({ session, sourcePath, index, startSeconds, endSeconds, overlapSeconds }: Parameters<NonNullable<Parameters<typeof createApp>[0]["saveChunkFile"]>>[0]) => {
-        const chunkPath = join(session.path, "chunks", "chunk-000000.webm");
-        await writeFile(chunkPath, await readFile(sourcePath));
-        return { index, path: chunkPath, startSeconds, endSeconds, overlapSeconds };
-      }
+    const saveChunkFile = vi.fn((input: Parameters<NonNullable<Parameters<typeof createApp>[0]["saveChunkFile"]>>[0]) =>
+      realSaveChunkFile(input)
     );
     const app = createApp({
       dataRoot,
@@ -1039,6 +1035,54 @@ describe("server routes", () => {
       status: "transcribed-partial",
       partial: true,
       failedChunks: [{ chunkIndex: 2, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
+    });
+  });
+
+  it("returns controlled JSON and records failed metadata when every upload chunk fails transcription", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockRejectedValue({
+      code: "MODEL_UNAVAILABLE",
+      status: 503,
+      message: "Model is unavailable."
+    });
+    const splitAudioIntoChunks = vi.fn(async ({ outputDirectory }: { outputDirectory: string }) => {
+      await mkdir(outputDirectory, { recursive: true });
+      const chunkPath = join(outputDirectory, "chunk-000000.webm");
+      await writeFile(chunkPath, "bad");
+      return [{ index: 0, path: chunkPath, startSeconds: 0, endSeconds: 30, durationSeconds: 30 }];
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe },
+      ffmpegChunks: {
+        resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .field("title", "Failed upload")
+      .attach("audio", Buffer.from("upload-audio"), "meeting.webm")
+      .expect(500);
+
+    expect(response.body).toMatchObject({
+      code: "UPLOAD_CHUNK_PROCESSING_FAILED",
+      message: "Uploaded audio chunks could not finish transcription."
+    });
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    const metadata = JSON.parse(
+      await readFile(join(dataRoot, "sessions", response.body.sessionId, "metadata.json"), "utf8")
+    );
+    expect(metadata).toMatchObject({
+      status: "transcription-failed",
+      error: {
+        code: "UPLOAD_CHUNK_PROCESSING_FAILED",
+        message: "Uploaded audio chunks could not finish transcription."
+      },
+      failedChunks: [{ chunkIndex: 1, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
     });
   });
 

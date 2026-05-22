@@ -613,9 +613,12 @@ async function handleUploadTranscription(input: UploadTranscriptionInput): Promi
       );
     }
 
-    await failUploadStageOnError(UPLOAD_CHUNK_PROCESSING_FAILED, () =>
-      input.chunkQueue.waitForSession(activeSession.id)
-    );
+    await failUploadStageOnError(UPLOAD_CHUNK_PROCESSING_FAILED, async () => {
+      await input.chunkQueue.waitForSession(activeSession.id);
+      if (!(await hasSuccessfulUploadChunk(activeSession))) {
+        throw new UploadTranscriptionStageError(UPLOAD_CHUNK_PROCESSING_FAILED);
+      }
+    });
     const finalized = await failUploadStageOnError(UPLOAD_FINALIZE_FAILED, () =>
       finalizeChunkSession({ session: activeSession })
     );
@@ -649,6 +652,15 @@ async function handleUploadTranscription(input: UploadTranscriptionInput): Promi
 
 async function readUploadTranscriptJson(transcriptJsonPath: string): Promise<unknown> {
   return JSON.parse(await readFile(transcriptJsonPath, "utf8"));
+}
+
+async function hasSuccessfulUploadChunk(session: ChunkSession): Promise<boolean> {
+  const manifest = JSON.parse(await readFile(session.manifestPath, "utf8")) as unknown;
+  return Array.isArray(manifest) && manifest.some((entry) => isChunkManifestStatus(entry, "transcribed"));
+}
+
+function isChunkManifestStatus(entry: unknown, status: string): boolean {
+  return typeof entry === "object" && entry !== null && "status" in entry && entry.status === status;
 }
 
 async function failUploadStageOnError<T>(
