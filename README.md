@@ -54,7 +54,7 @@ npm.cmd run dev
 
 The download step needs network access and a Hugging Face token with access to the accepted pyannote models. After the files are cached locally, diarization runs locally/offline from cache.
 
-If diarization is unavailable, missing, or not downloaded, transcription still runs without speaker labels. Offline speaker labels require running the diarization download first. CPU laptops may find diarization slower than transcription.
+If diarization is unavailable, missing, or not downloaded, transcription still runs; speaker separation is unavailable and any labels may be generic fallback labels. Offline speaker separation requires running the diarization download first. CPU laptops may find diarization slower than transcription.
 
 ## Saved Sessions
 
@@ -62,7 +62,11 @@ Recordings and transcripts are saved under `apps/server/data/sessions/` by defau
 
 Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
 
-On Windows, install ffmpeg and make sure `ffmpeg.exe` is available on `PATH`, or set `FFMPEG_PATH` to the full executable path.
+On Windows, install ffmpeg and make sure `ffmpeg.exe` is available on `PATH`, or set `FFMPEG_PATH` to the full executable path:
+
+```powershell
+$env:FFMPEG_PATH="C:\Program Files\ffmpeg\bin\ffmpeg.exe"
+```
 
 ## Verification
 
@@ -73,11 +77,15 @@ npm test
 npm run build
 ```
 
+In PowerShell environments where `npm.ps1` is blocked by execution policy, use `npm.cmd test` and `npm.cmd run build`.
+
 Start the local app:
 
 ```bash
 npm run dev
 ```
+
+The PowerShell equivalent is `npm.cmd run dev`.
 
 Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `apps/server/data/sessions/` with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
 
