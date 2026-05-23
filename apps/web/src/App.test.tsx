@@ -495,6 +495,30 @@ describe("App", () => {
       }));
     });
   });
+
+  it("keeps attention status when upload transcription returns a partial transcript", async () => {
+    const user = userEvent.setup();
+    const api = createApi({
+      transcribeAudio: vi.fn().mockResolvedValue({
+        sessionPath: "C:\\recordings\\meeting-1",
+        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
+        partial: true,
+        transcript: { text: "Partial upload transcript" }
+      })
+    });
+    const file = new File(["audio"], "meeting.wav", { type: "audio/wav" });
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByLabelText("Choose file")).toBeEnabled());
+    await user.upload(screen.getByLabelText("Choose file"), file);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Upload transcribed with a partial transcript.");
+    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
+    expect(screen.getByText("Partial upload transcript")).toBeInTheDocument();
+    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
+  });
 });
 
 type TestApi = AppApi & { lastEventHandlers?: SessionEventHandlers };

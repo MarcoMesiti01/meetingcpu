@@ -339,16 +339,11 @@ function normalizeSegments(
   manifestEntry: ChunkManifestEntry
 ): ChunkTranscriptSegment[] {
   return segments
-    .map((segment) => {
-      if (segment.start >= manifestEntry.startSeconds || segment.end > manifestEntry.endSeconds) {
-        return segment;
-      }
-      return {
-        ...segment,
-        start: segment.start + manifestEntry.startSeconds,
-        end: segment.end + manifestEntry.startSeconds
-      };
-    })
+    .map((segment) => ({
+      ...segment,
+      start: segment.start + manifestEntry.startSeconds,
+      end: segment.end + manifestEntry.startSeconds
+    }))
     .sort(compareSegments);
 }
 

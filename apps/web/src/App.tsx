@@ -14,6 +14,9 @@ type SourceType = "microphone" | "upload";
 
 interface TranscriptionResult {
   sessionPath?: string;
+  transcriptPath?: string;
+  transcriptJsonPath?: string;
+  partial?: boolean;
   transcript?: {
     text?: string;
   };
@@ -246,7 +249,16 @@ export default function App({ api, recorder }: AppProps) {
     }) as TranscriptionResult;
 
     setUploadTranscript(result.transcript?.text || result.text || "");
-    setSessionPaths({ sessionPath: result.sessionPath || "" });
+    setSessionPaths({
+      sessionPath: result.sessionPath || "",
+      transcriptPath: result.transcriptPath,
+      transcriptJsonPath: result.transcriptJsonPath
+    });
+    if (result.partial) {
+      setError("Upload transcribed with a partial transcript. Some chunks failed.");
+      setStatus("error");
+      return;
+    }
     setStatus("complete");
   }
 

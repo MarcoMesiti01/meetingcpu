@@ -18,6 +18,18 @@ export interface TranscribeAudioInput {
   title: string;
 }
 
+export interface TranscribeAudioResponse {
+  sessionPath?: string;
+  recordingPath?: string;
+  transcriptPath?: string;
+  transcriptJsonPath?: string;
+  partial?: boolean;
+  transcript?: {
+    text?: string;
+  };
+  text?: string;
+}
+
 export interface CreateSessionInput {
   title: string;
   modelId: string;
@@ -109,7 +121,7 @@ export function createApiClient(fetchImpl: typeof fetch = fetch, EventSourceCtor
       return response.json() as Promise<ModelsResponse>;
     },
 
-    async transcribeAudio(input: TranscribeAudioInput) {
+    async transcribeAudio(input: TranscribeAudioInput): Promise<TranscribeAudioResponse> {
       const form = new FormData();
       form.set("audio", input.audio, input.fileName);
       form.set("modelId", input.modelId);
@@ -123,7 +135,7 @@ export function createApiClient(fetchImpl: typeof fetch = fetch, EventSourceCtor
       if (!response.ok) {
         throw new Error(await readErrorMessage(response, TRANSCRIPTION_FAILED_MESSAGE));
       }
-      return response.json();
+      return response.json() as Promise<TranscribeAudioResponse>;
     },
 
     async createSession(input: CreateSessionInput): Promise<CreateSessionResponse> {

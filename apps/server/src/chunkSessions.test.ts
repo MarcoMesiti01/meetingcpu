@@ -220,8 +220,8 @@ describe("chunk session storage", () => {
         durationSeconds: 8,
         diarization: { available: true, enabled: false, error: "No speakers detected." },
         segments: [
-          { start: 13, end: 14, text: "Duplicate overlap.", speaker: "Speaker 2" },
-          { start: 16, end: 18, text: "New line." }
+          { start: 0, end: 1, text: "Duplicate overlap.", speaker: "Speaker 2" },
+          { start: 3, end: 5, text: "New line." }
         ]
       }
     });
@@ -279,7 +279,7 @@ describe("chunk session storage", () => {
         language: "en",
         durationSeconds: 4,
         diarization: { available: true, enabled: false, error: "No speakers detected." },
-        segments: [{ start: 4, end: 8, text: "Second chunk." }]
+        segments: [{ start: 0, end: 4, text: "Second chunk." }]
       }
     });
     await saveChunkResult({
@@ -430,8 +430,8 @@ describe("chunk session storage", () => {
         durationSeconds: 10,
         diarization: { available: false, enabled: false },
         segments: [
-          { start: 8, end: 13, text: "Overlap plus fresh." },
-          { start: 13, end: 16, text: "Clean fresh." }
+          { start: 0, end: 5, text: "Overlap plus fresh." },
+          { start: 5, end: 8, text: "Clean fresh." }
         ]
       }
     });
@@ -439,6 +439,42 @@ describe("chunk session storage", () => {
     expect(update.acceptedSegments).toEqual([{ start: 13, end: 16, text: "Clean fresh." }]);
     await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
       "[00:00:00] Previous ending.\n[00:00:13] Clean fresh.\n"
+    );
+  });
+
+  it("offsets late chunk-relative segment timestamps before overlap filtering", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 30 });
+    await saveManifestedChunk({ root, session, index: 2, startSeconds: 25, endSeconds: 55, overlapSeconds: 5 });
+
+    await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 1,
+        text: "First window.",
+        language: "en",
+        durationSeconds: 30,
+        diarization: { available: false, enabled: false },
+        segments: [{ start: 0, end: 30, text: "First window." }]
+      }
+    });
+
+    const update = await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 2,
+        text: "Late second-window speech.",
+        language: "en",
+        durationSeconds: 30,
+        diarization: { available: false, enabled: false },
+        segments: [{ start: 26, end: 29, text: "Late second-window speech." }]
+      }
+    });
+
+    expect(update.acceptedSegments).toEqual([{ start: 51, end: 54, text: "Late second-window speech." }]);
+    await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:00] First window.\n[00:00:51] Late second-window speech.\n"
     );
   });
 
