@@ -65,6 +65,39 @@ describe("transcription client", () => {
     expect(result).toMatchObject({ diarization: { available: true, enabled: true } });
   });
 
+  it("preserves explicit disabled diarization in the transcription request body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        text: "Hello.",
+        language: "en",
+        durationSeconds: 1,
+        segments: [{ start: 0, end: 1, text: "Hello." }],
+        diarization: { available: false, enabled: false }
+      })
+    });
+
+    const client = createTranscriptionClient("http://127.0.0.1:8765", fetchMock);
+    await client.transcribe({
+      audioPath: "C:/meeting/data/sessions/recording.webm",
+      modelId: "small",
+      language: null,
+      diarization: false
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8765/transcribe",
+      expect.objectContaining({
+        body: JSON.stringify({
+          audioPath: "C:/meeting/data/sessions/recording.webm",
+          modelId: "small",
+          language: null,
+          diarization: false
+        })
+      })
+    );
+  });
+
   it("turns service failures into structured local errors", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

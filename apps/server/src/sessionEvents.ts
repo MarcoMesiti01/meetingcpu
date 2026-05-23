@@ -154,12 +154,7 @@ function stateKey(event: SessionEvent): string {
 }
 
 function compareStoredSessionEvents(left: StoredSessionEvent, right: StoredSessionEvent): number {
-  return (
-    eventGroup(left.event) - eventGroup(right.event) ||
-    chunkIndex(left.event) - chunkIndex(right.event) ||
-    eventPrecedence(left.event) - eventPrecedence(right.event) ||
-    left.sequence - right.sequence
-  );
+  return eventGroup(left.event) - eventGroup(right.event) || left.sequence - right.sequence;
 }
 
 function eventGroup(event: SessionEvent): number {
@@ -171,32 +166,6 @@ function eventGroup(event: SessionEvent): number {
     case "chunk-failed":
       return 1;
     case "session-finalized":
-      return 2;
-  }
-}
-
-function chunkIndex(event: SessionEvent): number {
-  switch (event.type) {
-    case "chunk-saved":
-    case "chunk-transcribed":
-    case "chunk-failed":
-      return event.chunkIndex;
-    case "session-created":
-    case "session-finalized":
-      return -1;
-  }
-}
-
-function eventPrecedence(event: SessionEvent): number {
-  switch (event.type) {
-    case "session-created":
-    case "session-finalized":
-      return 0;
-    case "chunk-saved":
-      return 0;
-    case "chunk-transcribed":
-      return 1;
-    case "chunk-failed":
       return 2;
   }
 }

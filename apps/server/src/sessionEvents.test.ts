@@ -215,7 +215,7 @@ describe("session events", () => {
     expect(late.chunks).toEqual([]);
   });
 
-  it("replays chunks in deterministic transcript order after out-of-order completion", () => {
+  it("replays transcript snapshots in publish order after out-of-order completion", () => {
     const hub = new SessionEventHub();
     const subscribed = writer();
 
@@ -231,6 +231,7 @@ describe("session events", () => {
       sessionId: "session-1",
       chunkIndex: 2,
       text: "Second",
+      transcriptSegments: [{ start: 10, end: 12, text: "Second" }],
       diarization: { available: true, enabled: false }
     });
     hub.publish({ type: "chunk-saved", sessionId: "session-1", chunkIndex: 1 });
@@ -239,6 +240,10 @@ describe("session events", () => {
       sessionId: "session-1",
       chunkIndex: 1,
       text: "First",
+      transcriptSegments: [
+        { start: 0, end: 2, text: "First" },
+        { start: 10, end: 12, text: "Second" }
+      ],
       diarization: { available: true, enabled: false }
     });
 
@@ -251,20 +256,25 @@ describe("session events", () => {
         sessionPath: "/data/session-1",
         inProgressTranscriptPath: "/data/session-1/transcript.in-progress.txt"
       },
-      { type: "chunk-saved", sessionId: "session-1", chunkIndex: 1 },
-      {
-        type: "chunk-transcribed",
-        sessionId: "session-1",
-        chunkIndex: 1,
-        text: "First",
-        diarization: { available: true, enabled: false }
-      },
       { type: "chunk-saved", sessionId: "session-1", chunkIndex: 2 },
       {
         type: "chunk-transcribed",
         sessionId: "session-1",
         chunkIndex: 2,
         text: "Second",
+        transcriptSegments: [{ start: 10, end: 12, text: "Second" }],
+        diarization: { available: true, enabled: false }
+      },
+      { type: "chunk-saved", sessionId: "session-1", chunkIndex: 1 },
+      {
+        type: "chunk-transcribed",
+        sessionId: "session-1",
+        chunkIndex: 1,
+        text: "First",
+        transcriptSegments: [
+          { start: 0, end: 2, text: "First" },
+          { start: 10, end: 12, text: "Second" }
+        ],
         diarization: { available: true, enabled: false }
       }
     ]);

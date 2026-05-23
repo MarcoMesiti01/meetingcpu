@@ -359,7 +359,7 @@ function applyAcceptedSegments(results: ChunkStoredTranscriptResult[]): ChunkSto
     .map((result) => {
       const resultAcceptedSegments: ChunkTranscriptSegment[] = [];
       for (const segment of [...result.segments].sort(compareSegments)) {
-        if (segment.end > lastAcceptedEnd) {
+        if (segment.start >= lastAcceptedEnd) {
           resultAcceptedSegments.push(segment);
           lastAcceptedEnd = Math.max(lastAcceptedEnd, segment.end);
         }

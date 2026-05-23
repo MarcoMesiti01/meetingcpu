@@ -403,6 +403,45 @@ describe("chunk session storage", () => {
     ]);
   });
 
+  it("does not accept a segment that crosses the overlap boundary wholesale", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 10 });
+    await saveManifestedChunk({ root, session, index: 2, startSeconds: 8, endSeconds: 18, overlapSeconds: 2 });
+
+    await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 1,
+        text: "Previous ending.",
+        language: "en",
+        durationSeconds: 10,
+        diarization: { available: false, enabled: false },
+        segments: [{ start: 0, end: 10, text: "Previous ending." }]
+      }
+    });
+
+    const update = await saveChunkResult({
+      session,
+      result: {
+        chunkIndex: 2,
+        text: "Overlap plus fresh.\nClean fresh.",
+        language: "en",
+        durationSeconds: 10,
+        diarization: { available: false, enabled: false },
+        segments: [
+          { start: 8, end: 13, text: "Overlap plus fresh." },
+          { start: 13, end: 16, text: "Clean fresh." }
+        ]
+      }
+    });
+
+    expect(update.acceptedSegments).toEqual([{ start: 13, end: 16, text: "Clean fresh." }]);
+    await expect(readFile(session.inProgressTranscriptPath, "utf8")).resolves.toBe(
+      "[00:00:00] Previous ending.\n[00:00:13] Clean fresh.\n"
+    );
+  });
+
   it("rejects chunk results and failures when the manifest entry is missing", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });
