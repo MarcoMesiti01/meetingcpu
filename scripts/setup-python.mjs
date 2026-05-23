@@ -9,11 +9,12 @@ const pythonArgs = process.env.PYTHON ? [] : isWindows ? ["-3"] : [];
 const pythonHint = "Install Python 3.9+ or set PYTHON to a Python executable path.";
 const args = process.argv.slice(2);
 const downloadOnly = args[0] === "--download-model";
+const downloadDiarization = args[0] === "--download-diarization";
 const testPython = args[0] === "--test-python";
 const modelIds = downloadOnly ? args.slice(1) : ["small"];
 
 if (testPython) {
-  const pytestTemp = join(process.cwd(), ".pytest_tmp");
+  const pytestTemp = join(process.cwd(), ".pytest_tmp", `${process.pid}-${Date.now()}`);
   mkdirSync(pytestTemp, { recursive: true });
   run(
     venvPython,
@@ -50,6 +51,19 @@ if (!existsSync(venvPython)) {
 
 run(venvPython, ["-m", "pip", "install", "--upgrade", "pip"], "upgrade pip");
 run(venvPython, ["-m", "pip", "install", "-r", "services/whisper/requirements.txt"], "install whisper service dependencies");
+if (downloadDiarization) {
+  run(
+    venvPython,
+    ["-m", "pip", "install", "pyannote.audio"],
+    "install optional diarization dependencies"
+  );
+  run(
+    venvPython,
+    ["scripts/download-diarization.py", ...args.slice(1)],
+    "download diarization model"
+  );
+  process.exit(0);
+}
 for (const modelId of modelIds.length > 0 ? modelIds : ["small"]) {
   run(
     venvPython,
