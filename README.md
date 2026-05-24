@@ -53,16 +53,18 @@ The download step needs network access. After a model is present under `models/`
 
 ## Optional Speaker Labels
 
-Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the Hugging Face terms for `pyannote/speaker-diarization-3.1` and `pyannote/segmentation-3.0`, then run these commands in PowerShell:
+Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the Hugging Face conditions for [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1). Store the access token in the ignored `.env` file:
 
 ```powershell
 npm.cmd install
-$env:HF_TOKEN="hf_your_token_here"
+Set-Content -Path .env -Value 'HF_TOKEN=hf_your_token_here'
 npm.cmd run download:diarization
 npm.cmd run dev
 ```
 
-The download step needs network access and a Hugging Face token with access to the accepted pyannote models. After the files are cached locally, diarization runs locally/offline from cache.
+Alternatively, for one terminal session, set `$env:HF_TOKEN="hf_your_token_here"` before the download command. The download step needs network access and a Hugging Face token with access to the accepted model. After the files are saved locally, diarization runs locally/offline from `models/diarization/`.
+
+On Windows, `pyannote.audio` 4 also needs a full-shared FFmpeg installation for audio decoding, with FFmpeg DLL files available alongside `ffmpeg.exe` or on `PATH`. A static FFmpeg build can support uploaded-audio conversion but is not enough for pyannote speaker labels.
 
 If diarization is unavailable, missing, or not downloaded, transcription still runs; speaker separation is unavailable and any labels may be generic fallback labels. Offline speaker separation requires running the diarization download first. CPU laptops may find diarization slower than transcription.
 

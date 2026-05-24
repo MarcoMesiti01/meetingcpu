@@ -24,7 +24,8 @@ class LocalDiarizer:
 
     def diarize(self, audio_path: str) -> list[dict]:
         pipeline = self._load_pipeline()
-        diarization = pipeline(audio_path)
+        output = pipeline(audio_path)
+        diarization = getattr(output, "speaker_diarization", output)
         speakers = {}
         turns = []
 
