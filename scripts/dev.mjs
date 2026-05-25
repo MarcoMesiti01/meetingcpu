@@ -1,5 +1,6 @@
 import concurrently from "concurrently";
 import { join } from "node:path";
+import { reportProcessFailure } from "./dev-result.mjs";
 
 const isWindows = process.platform === "win32";
 const python = isWindows ? join(".venv", "Scripts", "python.exe") : join(".venv", "bin", "python");
@@ -26,7 +27,12 @@ const { result } = concurrently(
   }
 );
 
-await result;
+try {
+  await result;
+} catch (failures) {
+  reportProcessFailure(failures);
+  process.exitCode = 1;
+}
 
 function quote(value) {
   return value.includes(" ") ? `"${value}"` : value;

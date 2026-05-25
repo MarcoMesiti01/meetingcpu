@@ -12,7 +12,8 @@
     "dev": "node scripts/dev.mjs",
     "download:model": "node scripts/setup-python.mjs --download-model",
     "download:diarization": "node scripts/setup-python.mjs --download-diarization",
-    "test": "npm run test --workspaces --if-present && npm run test:python",
+    "test": "npm run test --workspaces --if-present && npm run test:scripts && npm run test:python",
+    "test:scripts": "node --test scripts/*.test.mjs",
     "test:python": "node scripts/setup-python.mjs --test-python",
     "build": "npm run build --workspaces --if-present"
   },
