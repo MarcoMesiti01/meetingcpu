@@ -1,8 +1,54 @@
+import os
 from pathlib import Path
 
 
 class DiarizationUnavailable(Exception):
     pass
+
+
+_ffmpeg_dll_directory = None
+
+
+def configure_ffmpeg_runtime(is_windows=None, local_app_data=None):
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows:
+        return None
+
+    for bin_dir in _ffmpeg_bin_candidates(local_app_data):
+        if not (bin_dir / "ffmpeg.exe").is_file():
+            continue
+        if not next(bin_dir.glob("avcodec-*.dll"), None):
+            continue
+
+        current_path = os.environ.get("PATH", "")
+        entries = [entry for entry in current_path.split(os.pathsep) if entry]
+        entries = [entry for entry in entries if entry.casefold() != str(bin_dir).casefold()]
+        os.environ["PATH"] = os.pathsep.join([str(bin_dir), *entries])
+
+        global _ffmpeg_dll_directory
+        add_dll_directory = getattr(os, "add_dll_directory", None)
+        if add_dll_directory is not None:
+            _ffmpeg_dll_directory = add_dll_directory(str(bin_dir))
+        return bin_dir
+
+    return None
+
+
+def _ffmpeg_bin_candidates(local_app_data=None):
+    configured_path = os.environ.get("FFMPEG_PATH", "").strip().strip('"').strip("'")
+    if configured_path:
+        yield Path(configured_path).parent
+
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry:
+            yield Path(entry)
+
+    app_data = Path(local_app_data or os.environ.get("LOCALAPPDATA", ""))
+    packages_dir = app_data / "Microsoft" / "WinGet" / "Packages"
+    if packages_dir.is_dir():
+        for executable in packages_dir.glob("*FFmpeg*Shared*/**/bin/ffmpeg.exe"):
+            yield executable.parent
 
 
 class LocalDiarizer:
@@ -24,7 +70,7 @@ class LocalDiarizer:
 
     def diarize(self, audio_path: str) -> list[dict]:
         pipeline = self._load_pipeline()
-        output = pipeline(audio_path)
+        output = pipeline(audio_path, preload=True)
         diarization = getattr(output, "speaker_diarization", output)
         speakers = {}
         turns = []
@@ -53,6 +99,7 @@ class LocalDiarizer:
             )
 
         try:
+            configure_ffmpeg_runtime()
             from pyannote.audio import Pipeline
         except ImportError as error:
             raise DiarizationUnavailable(

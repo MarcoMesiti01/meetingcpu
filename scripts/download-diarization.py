@@ -8,6 +8,7 @@ MODEL_ID = "pyannote/speaker-diarization-community-1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_DIR = REPO_ROOT / "models" / "diarization"
 ENV_PATH = REPO_ROOT / ".env"
+WHISPER_SERVICE_DIR = REPO_ROOT / "services" / "whisper"
 TERMS_URLS = [
     "https://huggingface.co/pyannote/speaker-diarization-community-1",
 ]
@@ -60,17 +61,22 @@ def main():
         import truststore
 
         truststore.inject_into_ssl()
+        if str(WHISPER_SERVICE_DIR) not in sys.path:
+            sys.path.insert(0, str(WHISPER_SERVICE_DIR))
+        from app.diarization import configure_ffmpeg_runtime
+
+        configure_ffmpeg_runtime()
+        import torchcodec  # noqa: F401
         from pyannote.audio import Pipeline
         from huggingface_hub import snapshot_download
-    except ImportError as exc:
+    except Exception as exc:
         print(
-            "[setup] pyannote.audio, huggingface_hub, and truststore are required "
-            "for diarization downloads.",
+            "[setup] Diarization audio decoding dependencies could not be loaded.",
             file=sys.stderr,
         )
         print(
-            "[setup] Install it into the Python environment, then rerun "
-            "npm run download:diarization.",
+            "[setup] On Windows, install the shared FFmpeg build with: "
+            "winget install --id Gyan.FFmpeg.Shared --exact --source winget",
             file=sys.stderr,
         )
         print(f"[setup] Import error: {exc}", file=sys.stderr)

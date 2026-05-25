@@ -1,11 +1,13 @@
 import builtins
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
+import app.diarization as diarization_module
 from app.diarization import DiarizationUnavailable, LocalDiarizer
 
 
@@ -79,6 +81,7 @@ def test_download_script_verifies_saved_model_can_be_loaded(monkeypatch, tmp_pat
             calls.append(("pipeline", model_id))
             return cls()
 
+    fake_torchcodec = types.ModuleType("torchcodec")
     fake_truststore = types.ModuleType("truststore")
     fake_truststore.inject_into_ssl = lambda: calls.append(("truststore",))
     fake_huggingface = types.ModuleType("huggingface_hub")
@@ -86,6 +89,13 @@ def test_download_script_verifies_saved_model_can_be_loaded(monkeypatch, tmp_pat
     fake_pyannote = types.ModuleType("pyannote")
     fake_audio = types.ModuleType("pyannote.audio")
     fake_audio.Pipeline = FakePipeline
+    monkeypatch.setattr(
+        diarization_module,
+        "configure_ffmpeg_runtime",
+        lambda: calls.append(("ffmpeg-runtime",)),
+        raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "torchcodec", fake_torchcodec)
     monkeypatch.setitem(sys.modules, "truststore", fake_truststore)
     monkeypatch.setitem(sys.modules, "huggingface_hub", fake_huggingface)
     monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
@@ -97,9 +107,44 @@ def test_download_script_verifies_saved_model_can_be_loaded(monkeypatch, tmp_pat
 
     assert calls == [
         ("truststore",),
+        ("ffmpeg-runtime",),
         ("snapshot", module.MODEL_ID, module.MODEL_DIR, "token"),
         ("pipeline", str(module.MODEL_DIR)),
     ]
+
+
+def test_configure_ffmpeg_runtime_discovers_installed_shared_windows_build(
+    monkeypatch, tmp_path
+):
+    shared_bin = (
+        tmp_path
+        / "Microsoft"
+        / "WinGet"
+        / "Packages"
+        / "Gyan.FFmpeg.Shared_test"
+        / "ffmpeg-full_build-shared"
+        / "bin"
+    )
+    shared_bin.mkdir(parents=True)
+    (shared_bin / "ffmpeg.exe").write_text("")
+    (shared_bin / "avcodec-62.dll").write_text("")
+    added = []
+
+    monkeypatch.setenv("PATH", "C:\\static-ffmpeg\\bin")
+    monkeypatch.setattr(
+        diarization_module.os,
+        "add_dll_directory",
+        lambda value: added.append(Path(value)) or object(),
+        raising=False,
+    )
+
+    configured = diarization_module.configure_ffmpeg_runtime(
+        is_windows=True, local_app_data=tmp_path
+    )
+
+    assert configured == shared_bin
+    assert added == [shared_bin]
+    assert str(shared_bin) == os.environ["PATH"].split(os.pathsep)[0]
 
 
 def test_local_diarizer_reads_pyannote_4_speaker_diarization_output(monkeypatch, tmp_path):
@@ -124,15 +169,24 @@ def test_local_diarizer_reads_pyannote_4_speaker_diarization_output(monkeypatch,
         def from_pretrained(cls, model_path):
             return cls()
 
-        def __call__(self, audio_path):
+        def __call__(self, audio_path, preload=False):
+            assert preload is True
             return Output()
 
     fake_pyannote = types.ModuleType("pyannote")
     fake_audio = types.ModuleType("pyannote.audio")
     fake_audio.Pipeline = FakePipeline
+    configured = []
+    monkeypatch.setattr(
+        diarization_module,
+        "configure_ffmpeg_runtime",
+        lambda: configured.append(True),
+        raising=False,
+    )
     monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
     monkeypatch.setitem(sys.modules, "pyannote.audio", fake_audio)
 
     assert LocalDiarizer(model_dir=model_dir).diarize("recording.wav") == [
         {"start": 0.0, "end": 1.5, "speaker": "Speaker 1"}
     ]
+    assert configured == [True]

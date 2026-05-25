@@ -64,7 +64,11 @@ npm.cmd run dev
 
 Alternatively, for one terminal session, set `$env:HF_TOKEN="hf_your_token_here"` before the download command. The download step needs network access and a Hugging Face token with access to the accepted model. After the files are saved locally, diarization runs locally/offline from `models/diarization/`.
 
-On Windows, `pyannote.audio` 4 also needs a full-shared FFmpeg installation for audio decoding, with FFmpeg DLL files available alongside `ffmpeg.exe` or on `PATH`. A static FFmpeg build can support uploaded-audio conversion but is not enough for pyannote speaker labels.
+On Windows, `pyannote.audio` 4 also needs a full-shared FFmpeg installation for audio decoding, with FFmpeg DLL files available alongside `ffmpeg.exe` or on `PATH`. A static FFmpeg build can support uploaded-audio conversion but is not enough for pyannote speaker labels. Install the shared build, then start a new terminal before running the download command:
+
+```powershell
+winget install --id Gyan.FFmpeg.Shared --exact --source winget
+```
 
 If diarization is unavailable, missing, or not downloaded, transcription still runs; speaker separation is unavailable and any labels may be generic fallback labels. Offline speaker separation requires running the diarization download first. CPU laptops may find diarization slower than transcription.
 
