@@ -2,22 +2,27 @@ import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { createRoutes, type RouteDependencies } from "./routes.js";
 
-export function createApp(dependencies: RouteDependencies) {
+export function createApp(dependencies: RouteDependencies & { allowedOrigins?: string[] }) {
   const app = express();
-  app.use(cors({ origin: corsOrigin }));
+  const allowedOrigins = new Set((dependencies.allowedOrigins ?? []).map((origin) => origin.trim()).filter(Boolean));
+  app.use(cors({ origin: corsOrigin(allowedOrigins) }));
   app.use(express.json());
   app.use("/api", createRoutes(dependencies));
   app.use(errorHandler);
   return app;
 }
 
-function corsOrigin(origin: string | undefined, callback: (error: Error | null, origin?: boolean | string) => void): void {
-  if (!origin) {
-    callback(null, true);
-    return;
-  }
+function corsOrigin(
+  allowedOrigins: Set<string>
+): (origin: string | undefined, callback: (error: Error | null, origin?: boolean | string) => void) => void {
+  return (origin, callback) => {
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
 
-  callback(null, isAllowedLocalOrigin(origin) ? origin : false);
+    callback(null, isAllowedLocalOrigin(origin) || allowedOrigins.has(origin) ? origin : false);
+  };
 }
 
 function isAllowedLocalOrigin(origin: string): boolean {

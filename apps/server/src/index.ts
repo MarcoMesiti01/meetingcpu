@@ -5,7 +5,9 @@ import { createTranscriptionClient } from "./transcriptionClient.js";
 const config = loadConfig();
 const app = createApp({
   dataRoot: config.dataRoot,
-  transcriptionClient: createTranscriptionClient(config.transcriptionServiceUrl)
+  transcriptionClient: createTranscriptionClient(config.transcriptionServiceUrl),
+  allowedOrigins: config.allowedOrigins,
+  enableFfmpegUploadFallback: config.enableFfmpegUploadFallback
 });
 
 app.listen(config.port, config.host, () => {

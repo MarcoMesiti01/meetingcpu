@@ -7,21 +7,11 @@ import {
   type TranscriptSegment,
   type createApiClient
 } from "./api/client";
+import { BrowserUploadChunker } from "./audio/uploadChunker";
+import type { UploadedAudioChunk } from "./audio/uploadChunker";
 import type { RecordedAudioChunk, StartChunkedRecordingOptions } from "./audio/recorder";
 
 type Status = "loading" | "ready" | "starting" | "recording" | "finalizing" | "transcribing" | "complete" | "error";
-type SourceType = "microphone" | "upload";
-
-interface TranscriptionResult {
-  sessionPath?: string;
-  transcriptPath?: string;
-  transcriptJsonPath?: string;
-  partial?: boolean;
-  transcript?: {
-    text?: string;
-  };
-  text?: string;
-}
 
 interface SessionPaths {
   sessionPath?: string;
@@ -48,13 +38,18 @@ export interface AppRecorder {
   stop(): Promise<Blob>;
 }
 
-export default function App({ api, recorder }: AppProps) {
+export interface AppUploadChunker {
+  chunkFile(file: File): Promise<UploadedAudioChunk[]>;
+}
+
+export default function App({ api, recorder, uploadChunker = new BrowserUploadChunker() }: AppProps) {
   const [status, setStatus] = useState<Status>("loading");
   const [models, setModels] = useState<ModelOption[]>([]);
   const [modelId, setModelId] = useState("");
   const [title, setTitle] = useState("Untitled meeting");
   const [error, setError] = useState("");
   const [modelLoadError, setModelLoadError] = useState(false);
+  const [speakerLabelsEnabled, setSpeakerLabelsEnabled] = useState(false);
   const [uploadTranscript, setUploadTranscript] = useState("");
   const [transcriptGroups, setTranscriptGroups] = useState<TranscriptGroup[]>([]);
   const [sessionId, setSessionId] = useState("");
@@ -139,7 +134,7 @@ export default function App({ api, recorder }: AppProps) {
       const created = await api.createSession({
         title: title.trim() || "Untitled meeting",
         modelId,
-        diarization: true
+        diarization: speakerLabelsEnabled
       });
       activeSessionIdRef.current = created.sessionId;
       setSessionId(created.sessionId);
@@ -149,7 +144,7 @@ export default function App({ api, recorder }: AppProps) {
       });
       const connection = api.subscribeToSessionEvents(created.sessionId, {
         onEvent: handleSessionEvent,
-        onError: (streamError) => {
+        onError: (streamError: unknown) => {
           setError(getErrorMessage(streamError, "Session event stream failed."));
           setStatus("error");
         }
@@ -157,7 +152,7 @@ export default function App({ api, recorder }: AppProps) {
       eventConnectionRef.current = connection;
 
       await recorder.startChunked({
-        onChunk: (chunk) => uploadChunk(created.sessionId, chunk)
+        onChunk: (chunk: RecordedAudioChunk) => uploadChunk(created.sessionId, chunk)
       });
 
       clearResult();
@@ -230,36 +225,48 @@ export default function App({ api, recorder }: AppProps) {
 
     clearResult();
     setStatus("transcribing");
+    setError("");
 
     try {
-      await transcribe(file, file.name || "upload.webm", "upload");
+      const chunks = await uploadChunker.chunkFile(file);
+      const created = await api.createSession({
+        title: title.trim() || "Untitled meeting",
+        modelId,
+        sourceType: "upload",
+        diarization: speakerLabelsEnabled
+      });
+      activeSessionIdRef.current = created.sessionId;
+      setSessionId(created.sessionId);
+      setSessionPaths({
+        sessionPath: created.sessionPath,
+        inProgressTranscriptPath: created.inProgressTranscriptPath
+      });
+      const connection = api.subscribeToSessionEvents(created.sessionId, {
+        onEvent: handleSessionEvent,
+        onError: (streamError: unknown) => {
+          setError(getErrorMessage(streamError, "Session event stream failed."));
+          setStatus("error");
+        }
+      });
+      eventConnectionRef.current = connection;
+
+      for (const chunk of chunks) {
+        await uploadPreparedChunk(created.sessionId, chunk);
+        setSavedChunkCount((count) => Math.max(count, chunk.chunkIndex));
+      }
+
+      const finalized = await api.finalizeSession(created.sessionId);
+      applyFinalizedSession(finalized);
+      setSessionId("");
+      setStatus(finalized.partial ? "error" : "complete");
     } catch (uploadError) {
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
       setError(getErrorMessage(uploadError, "Could not transcribe upload."));
+      setSessionId("");
       setStatus("error");
     }
-  }
-
-  async function transcribe(audio: Blob, fileName: string, sourceType: SourceType) {
-    const result = await api.transcribeAudio({
-      audio,
-      fileName,
-      modelId,
-      sourceType,
-      title: title.trim() || "Untitled meeting"
-    }) as TranscriptionResult;
-
-    setUploadTranscript(result.transcript?.text || result.text || "");
-    setSessionPaths({
-      sessionPath: result.sessionPath || "",
-      transcriptPath: result.transcriptPath,
-      transcriptJsonPath: result.transcriptJsonPath
-    });
-    if (result.partial) {
-      setError("Upload transcribed with a partial transcript. Some chunks failed.");
-      setStatus("error");
-      return;
-    }
-    setStatus("complete");
   }
 
   async function uploadChunk(activeSessionId: string, chunk: RecordedAudioChunk) {
@@ -282,6 +289,21 @@ export default function App({ api, recorder }: AppProps) {
       setStatus("error");
       throw chunkError;
     }
+  }
+
+  async function uploadPreparedChunk(activeSessionId: string, chunk: UploadedAudioChunk) {
+    await api.uploadSessionChunk({
+      sessionId: activeSessionId,
+      audio: chunk.blob,
+      fileName: chunk.fileName,
+      chunkIndex: chunk.chunkIndex,
+      startSeconds: chunk.startSeconds,
+      endSeconds: chunk.endSeconds,
+      overlapSeconds: chunk.overlapSeconds,
+      modelId,
+      sourceType: "upload",
+      mimeType: chunk.mimeType
+    });
   }
 
   function handleSessionEvent(event: SessionEvent) {
@@ -323,6 +345,9 @@ export default function App({ api, recorder }: AppProps) {
         ...paths,
         transcriptPath: event.transcriptPath
       }));
+      eventConnectionRef.current?.close();
+      eventConnectionRef.current = null;
+      activeSessionIdRef.current = "";
     }
   }
 
@@ -396,6 +421,19 @@ export default function App({ api, recorder }: AppProps) {
                   ))}
                 </select>
               </label>
+
+              <div className="field">
+                <span>Speaker labels</span>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={speakerLabelsEnabled}
+                    onChange={(event) => setSpeakerLabelsEnabled(event.target.checked)}
+                    disabled={status === "loading" || status === "starting" || status === "recording" || status === "finalizing" || status === "transcribing"}
+                  />
+                  Enable speaker labels
+                </label>
+              </div>
             </div>
 
             {selectedModel?.warning ? (
@@ -478,6 +516,7 @@ export default function App({ api, recorder }: AppProps) {
 interface AppProps {
   api: AppApi;
   recorder: AppRecorder;
+  uploadChunker?: AppUploadChunker;
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
@@ -494,7 +533,7 @@ function renderTranscript(status: Status, groups: TranscriptGroup[], uploadTrans
   if (status === "starting") return "Starting live recording session...";
   if (status === "recording" && groups.length === 0) return "Recording from microphone. Transcript segments will appear as chunks complete.";
   if (status === "finalizing") return groups.length > 0 ? groups.map(renderTranscriptGroup) : "Finalizing saved chunks...";
-  if (status === "transcribing") return "Transcribing uploaded audio...";
+  if (status === "transcribing") return groups.length > 0 ? groups.map(renderTranscriptGroup) : "Transcribing uploaded audio...";
   if (groups.length > 0) return groups.map(renderTranscriptGroup);
   return uploadTranscript || "No transcript yet.";
 }

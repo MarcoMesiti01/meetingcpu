@@ -52,7 +52,7 @@ describe("App", () => {
       expect(api.createSession).toHaveBeenCalledWith({
         title: "Untitled meeting",
         modelId: "small",
-        diarization: true
+        diarization: false
       });
     });
     expect(api.subscribeToSessionEvents).toHaveBeenCalledTimes(1);
@@ -93,6 +93,25 @@ describe("App", () => {
     expect(screen.getByText("Session: C:\\recordings\\meeting-1")).toBeInTheDocument();
     expect(screen.getByText("In progress: C:\\recordings\\meeting-1\\transcript.in-progress.txt")).toBeInTheDocument();
     expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
+  });
+
+  it("enables speaker labels only when explicitly selected", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+
+    render(<App api={api} recorder={createRecorder()} />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Start recording" })).toBeEnabled());
+    await user.click(screen.getByLabelText("Enable speaker labels"));
+    await user.click(screen.getByRole("button", { name: "Start recording" }));
+
+    await waitFor(() => {
+      expect(api.createSession).toHaveBeenCalledWith({
+        title: "Untitled meeting",
+        modelId: "small",
+        diarization: true
+      });
+    });
   });
 
   it("shows a retry action when model loading fails and reloads models", async () => {
@@ -476,48 +495,232 @@ describe("App", () => {
     expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
   });
 
-  it("transcribes uploaded audio with upload source type", async () => {
+  it("transcribes uploaded files through browser chunks and chunk sessions without legacy upload transcription", async () => {
     const user = userEvent.setup();
-    const api = createApi();
-    const file = new File(["audio"], "meeting.wav", { type: "audio/wav" });
-
-    render(<App api={api} recorder={createRecorder()} />);
-
-    await waitFor(() => expect(screen.getByLabelText("Choose file")).toBeEnabled());
-    await user.upload(screen.getByLabelText("Choose file"), file);
-
-    await waitFor(() => {
-      expect(api.transcribeAudio).toHaveBeenCalledWith(expect.objectContaining({
-        audio: file,
-        fileName: "meeting.wav",
-        modelId: "small",
-        sourceType: "upload"
-      }));
-    });
-  });
-
-  it("keeps attention status when upload transcription returns a partial transcript", async () => {
-    const user = userEvent.setup();
+    const chunkFile = vi.fn().mockResolvedValue([
+      createUploadChunk({
+        fileName: "chunk-000001.wav",
+        mimeType: "audio/wav",
+        fileExtension: "wav"
+      })
+    ]);
     const api = createApi({
-      transcribeAudio: vi.fn().mockResolvedValue({
-        sessionPath: "C:\\recordings\\meeting-1",
-        transcriptPath: "C:\\recordings\\meeting-1\\transcript.txt",
-        transcriptJsonPath: "C:\\recordings\\meeting-1\\transcript.json",
-        partial: true,
-        transcript: { text: "Partial upload transcript" }
+      createSession: vi.fn().mockResolvedValue({
+        sessionId: "upload-session",
+        sessionPath: "C:\\recordings\\upload-session",
+        inProgressTranscriptPath: "C:\\recordings\\upload-session\\transcript.in-progress.txt"
+      }),
+      uploadSessionChunk: vi.fn().mockResolvedValue({ sessionId: "upload-session", chunkIndex: 1, status: "queued" }),
+      finalizeSession: vi.fn().mockResolvedValue({
+        sessionId: "upload-session",
+        transcriptPath: "C:\\recordings\\upload-session\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\upload-session\\transcript.json",
+        partial: false
       })
     });
-    const file = new File(["audio"], "meeting.wav", { type: "audio/wav" });
+    const uploadChunker = { chunkFile };
 
-    render(<App api={api} recorder={createRecorder()} />);
+    render(<App api={api} recorder={createRecorder()} uploadChunker={uploadChunker} />);
 
-    await waitFor(() => expect(screen.getByLabelText("Choose file")).toBeEnabled());
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("small"));
+    const file = new File(["audio"], "meeting.mp3", { type: "audio/mpeg" });
     await user.upload(screen.getByLabelText("Choose file"), file);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Upload transcribed with a partial transcript.");
-    expect(screen.getByRole("status")).toHaveTextContent("Needs attention");
-    expect(screen.getByText("Partial upload transcript")).toBeInTheDocument();
-    expect(screen.getByText("Final transcript: C:\\recordings\\meeting-1\\transcript.txt")).toBeInTheDocument();
+    await waitFor(() => expect(chunkFile).toHaveBeenCalledTimes(1));
+    expect(chunkFile.mock.calls[0]?.[0]).toMatchObject({
+      name: "meeting.mp3",
+      type: "audio/mpeg"
+    });
+    expect(api.createSession).toHaveBeenCalledWith({
+      title: "Untitled meeting",
+      modelId: "small",
+      sourceType: "upload",
+      diarization: false
+    });
+    expect(api.uploadSessionChunk).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "upload-session",
+      sourceType: "upload",
+      fileName: "chunk-000001.wav",
+      mimeType: "audio/wav"
+    }));
+    expect(api.finalizeSession).toHaveBeenCalledWith("upload-session");
+    expect((api.createSession as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan(
+      (api.uploadSessionChunk as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    );
+    expect((api.uploadSessionChunk as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]).toBeLessThan(
+      (api.finalizeSession as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
+    );
+    expect(api.transcribeAudio).not.toHaveBeenCalled();
+  });
+
+  it("subscribes to upload session events, renders chunk transcription, and closes the connection after finalize", async () => {
+    const user = userEvent.setup();
+    const closeEvents = vi.fn();
+    let eventHandlers: SessionEventHandlers | undefined;
+    let resolveFinalize: (value: Awaited<ReturnType<AppApi["finalizeSession"]>>) => void = () => {
+      throw new Error("finalize promise was not created");
+    };
+    const finalizeSession = vi.fn().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFinalize = resolve as (value: Awaited<ReturnType<AppApi["finalizeSession"]>>) => void;
+        })
+    );
+    const chunkFile = vi.fn().mockResolvedValue([
+      createUploadChunk({
+        fileName: "chunk-000001.wav",
+        mimeType: "audio/wav",
+        fileExtension: "wav"
+      })
+    ]);
+    const api = createApi({
+      createSession: vi.fn().mockResolvedValue({
+        sessionId: "upload-session",
+        sessionPath: "C:\\recordings\\upload-session",
+        inProgressTranscriptPath: "C:\\recordings\\upload-session\\transcript.in-progress.txt"
+      }),
+      subscribeToSessionEvents: vi.fn((_sessionId, handlers) => {
+        eventHandlers = handlers;
+        return { close: closeEvents };
+      }),
+      uploadSessionChunk: vi.fn().mockResolvedValue({ sessionId: "upload-session", chunkIndex: 1, status: "queued" }),
+      finalizeSession
+    });
+    const uploadChunker = { chunkFile };
+
+    render(<App api={api} recorder={createRecorder()} uploadChunker={uploadChunker} />);
+
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("small"));
+    await user.upload(screen.getByLabelText("Choose file"), new File(["audio"], "meeting.mp3", { type: "audio/mpeg" }));
+
+    await waitFor(() => expect(api.subscribeToSessionEvents).toHaveBeenCalledWith("upload-session", expect.any(Object)));
+    expect(api.uploadSessionChunk).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "upload-session",
+      sourceType: "upload"
+    }));
+
+    await waitFor(() => expect(api.finalizeSession).toHaveBeenCalledWith("upload-session"));
+    await act(async () => {
+      resolveFinalize({
+        sessionId: "upload-session",
+        transcriptPath: "C:\\recordings\\upload-session\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\upload-session\\transcript.json",
+        partial: false
+      });
+    });
+    expect(closeEvents).not.toHaveBeenCalled();
+
+    await act(async () => {
+      emitEvent(eventHandlers, {
+        type: "chunk-transcribed",
+        sessionId: "upload-session",
+        chunkIndex: 1,
+        text: "[00:00:00] Speaker 1: Uploaded transcript is visible.",
+        diarization: { available: true, enabled: true }
+      });
+    });
+
+    expect(await screen.findByText("Speaker 1")).toBeInTheDocument();
+    expect(screen.getByText("Uploaded transcript is visible.")).toBeInTheDocument();
+    expect(screen.getByText("Chunks transcribed").closest(".metric")).toHaveTextContent("1");
+
+    await act(async () => {
+      emitEvent(eventHandlers, {
+        type: "session-finalized",
+        sessionId: "upload-session",
+        transcriptPath: "C:\\recordings\\upload-session\\transcript.txt",
+        partial: false
+      });
+    });
+    expect(closeEvents).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Final transcript: C:\\recordings\\upload-session\\transcript.txt")).toBeInTheDocument();
+    expect(api.transcribeAudio).not.toHaveBeenCalled();
+  });
+
+  it("keeps upload event stream open for very late server finalization events", async () => {
+    const user = userEvent.setup();
+    const closeEvents = vi.fn();
+    let eventHandlers: SessionEventHandlers | undefined;
+    const chunkFile = vi.fn().mockResolvedValue([createUploadChunk()]);
+    const api = createApi({
+      createSession: vi.fn().mockResolvedValue({
+        sessionId: "late-upload-session",
+        sessionPath: "C:\\recordings\\late-upload-session",
+        inProgressTranscriptPath: "C:\\recordings\\late-upload-session\\transcript.in-progress.txt"
+      }),
+      subscribeToSessionEvents: vi.fn((_sessionId, handlers) => {
+        eventHandlers = handlers;
+        return { close: closeEvents };
+      }),
+      uploadSessionChunk: vi.fn().mockResolvedValue({ sessionId: "late-upload-session", chunkIndex: 1, status: "queued" }),
+      finalizeSession: vi.fn().mockResolvedValue({
+        sessionId: "late-upload-session",
+        transcriptPath: "C:\\recordings\\late-upload-session\\transcript.txt",
+        transcriptJsonPath: "C:\\recordings\\late-upload-session\\transcript.json",
+        partial: false
+      })
+    });
+
+    render(<App api={api} recorder={createRecorder()} uploadChunker={{ chunkFile }} />);
+
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("small"));
+    await user.upload(screen.getByLabelText("Choose file"), new File(["audio"], "meeting.mp3", { type: "audio/mpeg" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Complete"));
+
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        vi.advanceTimersByTime(11_000);
+      });
+      expect(closeEvents).not.toHaveBeenCalled();
+
+      await act(async () => {
+        emitEvent(eventHandlers, {
+          type: "session-finalized",
+          sessionId: "late-upload-session",
+          transcriptPath: "C:\\recordings\\late-upload-session\\transcript.txt",
+          partial: false
+        });
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(closeEvents).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Final transcript: C:\\recordings\\late-upload-session\\transcript.txt")).toBeInTheDocument();
+  });
+
+  it("shows a clear upload decode error before creating a session", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const chunkFile = vi.fn().mockRejectedValue(new Error("This audio format is not supported by your browser on this machine."));
+    const uploadChunker = { chunkFile };
+
+    render(<App api={api} recorder={createRecorder()} uploadChunker={uploadChunker} />);
+
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("small"));
+    await user.upload(screen.getByLabelText("Choose file"), new File(["bad"], "meeting.mp3", { type: "audio/mpeg" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("This audio format is not supported");
+    expect(api.createSession).not.toHaveBeenCalled();
+    expect(api.transcribeAudio).not.toHaveBeenCalled();
+  });
+
+  it("does not create a session when upload chunking rejects oversized files", async () => {
+    const user = userEvent.setup();
+    const api = createApi();
+    const uploadChunker = {
+      chunkFile: vi.fn().mockRejectedValue(new Error("Uploaded files must be 100 MB or smaller."))
+    };
+
+    render(<App api={api} recorder={createRecorder()} uploadChunker={uploadChunker} />);
+
+    await waitFor(() => expect(screen.getByLabelText("Model")).toHaveValue("small"));
+    await user.upload(screen.getByLabelText("Choose file"), new File(["big"], "meeting.mp3", { type: "audio/mpeg" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Uploaded files must be 100 MB or smaller.");
+    expect(api.createSession).not.toHaveBeenCalled();
+    expect(api.uploadSessionChunk).not.toHaveBeenCalled();
   });
 });
 
@@ -586,6 +789,29 @@ function createChunk(overrides: Partial<RecordedAudioChunk> & { text?: string } 
     mimeType: "audio/webm",
     fileExtension: "webm",
     fileName: "chunk-000001.webm",
+    ...overrides
+  };
+}
+
+function createUploadChunk(overrides: Partial<{
+  chunkIndex: number;
+  startSeconds: number;
+  endSeconds: number;
+  overlapSeconds: number;
+  blob: Blob;
+  mimeType: string;
+  fileExtension: string;
+  fileName: string;
+}> = {}) {
+  return {
+    chunkIndex: 1,
+    startSeconds: 0,
+    endSeconds: 30,
+    overlapSeconds: 0,
+    blob: new Blob(["audio"], { type: "audio/wav" }),
+    mimeType: "audio/wav",
+    fileExtension: "wav",
+    fileName: "chunk-000001.wav",
     ...overrides
   };
 }

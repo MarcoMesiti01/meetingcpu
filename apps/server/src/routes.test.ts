@@ -25,7 +25,8 @@ describe("server routes", () => {
   it("sets CORS headers only for local browser origins", async () => {
     const app = createApp({
       dataRoot: await mkdtemp(join(tmpdir(), "meetingcpu-")),
-      transcriptionClient: fakeTranscriptionClient()
+      transcriptionClient: fakeTranscriptionClient(),
+      allowedOrigins: ["http://192.168.1.50:5173"]
     });
 
     await request(app)
@@ -36,6 +37,12 @@ describe("server routes", () => {
 
     const disallowed = await request(app).get("/api/health").set("Origin", "https://example.com").expect(200);
     expect(disallowed.headers["access-control-allow-origin"]).toBeUndefined();
+
+    await request(app)
+      .get("/api/health")
+      .set("Origin", "http://192.168.1.50:5173")
+      .expect(200)
+      .expect("Access-Control-Allow-Origin", "http://192.168.1.50:5173");
   });
 
   it("saves a microphone recording and returns a transcript", async () => {
@@ -85,7 +92,7 @@ describe("server routes", () => {
 
     const response = await request(app)
       .post("/api/sessions")
-      .send({ title: "Live Planning", modelId: "small", language: "en", diarization: true })
+      .send({ title: "Live Planning", modelId: "small", language: "en", diarization: true, sourceType: "upload" })
       .expect(201);
 
     expect(response.body.sessionId).toContain("live-planning");
@@ -94,6 +101,34 @@ describe("server routes", () => {
       join(dataRoot, "sessions", response.body.sessionId, "transcript.in-progress.txt")
     );
     await expect(readFile(response.body.inProgressTranscriptPath, "utf8")).resolves.toBe("");
+    const metadata = JSON.parse(await readFile(join(response.body.sessionPath, "metadata.json"), "utf8"));
+    expect(metadata).toMatchObject({
+      sourceType: "upload",
+      modelId: "small",
+      status: "chunk-session-created"
+    });
+  });
+
+  it("defaults chunked sessions to microphone source type when omitted or invalid", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: fakeTranscriptionClient()
+    });
+
+    const defaultResponse = await request(app)
+      .post("/api/sessions")
+      .send({ title: "Default Source", modelId: "small" })
+      .expect(201);
+    const invalidResponse = await request(app)
+      .post("/api/sessions")
+      .send({ title: "Invalid Source", modelId: "small", sourceType: "speakerphone" })
+      .expect(201);
+
+    const defaultMetadata = JSON.parse(await readFile(join(defaultResponse.body.sessionPath, "metadata.json"), "utf8"));
+    const invalidMetadata = JSON.parse(await readFile(join(invalidResponse.body.sessionPath, "metadata.json"), "utf8"));
+    expect(defaultMetadata.sourceType).toBe("microphone");
+    expect(invalidMetadata.sourceType).toBe("microphone");
   });
 
   it("streams session events as SSE with replayed session state", async () => {
@@ -162,7 +197,7 @@ describe("server routes", () => {
     });
     const created = await request(app)
       .post("/api/sessions")
-      .send({ title: "Chunks", modelId: "small", language: "en" })
+      .send({ title: "Chunks", modelId: "small", language: "en", diarization: true })
       .expect(201);
     events.subscribe(created.body.sessionId, (event) => published.push(event));
 
@@ -251,6 +286,30 @@ describe("server routes", () => {
     const created = await request(app)
       .post("/api/sessions")
       .send({ title: "No diarization", modelId: "small", diarization: false })
+      .expect(201);
+
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
+    await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(200);
+
+    expect(transcribe).toHaveBeenCalledWith(expect.objectContaining({ diarization: false }));
+  });
+
+  it("keeps diarization disabled by default for live sessions", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockResolvedValue({
+      text: "Default speaker label.",
+      language: "en",
+      durationSeconds: 1,
+      segments: [{ start: 0, end: 1, text: "Default speaker label." }],
+      diarization: { available: false, enabled: false }
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe }
+    });
+    const created = await request(app)
+      .post("/api/sessions")
+      .send({ title: "Default diarization", modelId: "small" })
       .expect(201);
 
     await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
@@ -755,12 +814,38 @@ describe("server routes", () => {
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
   });
 
+  it("forwards explicit diarization opt-in for legacy microphone transcription", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockResolvedValue({
+      text: "Speaker labels requested.",
+      language: "en",
+      durationSeconds: 1,
+      segments: [{ start: 0, end: 1, text: "Speaker labels requested.", speaker: "Speaker 1" }],
+      diarization: { available: true, enabled: true }
+    });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe }
+    });
+
+    await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "microphone")
+      .field("modelId", "small")
+      .field("diarization", "true")
+      .attach("audio", Buffer.from("audio"), "recording.webm")
+      .expect(201);
+
+    expect(transcribe).toHaveBeenCalledWith(expect.objectContaining({ diarization: true }));
+  });
+
   it("returns a controlled error for upload chunking when ffmpeg is unavailable", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const transcriptionClient = fakeTranscriptionClient();
     const app = createApp({
       dataRoot,
       transcriptionClient,
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue(null)
       }
@@ -777,6 +862,38 @@ describe("server routes", () => {
       code: "UPLOAD_CHUNKING_UNAVAILABLE",
       message: "Upload chunking requires ffmpeg. Install ffmpeg or set FFMPEG_PATH."
     });
+    expect(transcriptionClient.transcribe).not.toHaveBeenCalled();
+    await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
+    await expect(access(join(dataRoot, "sessions"))).rejects.toThrow();
+  });
+
+  it("keeps server-side upload chunking disabled unless the fallback is explicitly enabled", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const resolveFfmpegPath = vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe");
+    const splitAudioIntoChunks = vi.fn();
+    const transcriptionClient = fakeTranscriptionClient();
+    const app = createApp({
+      dataRoot,
+      transcriptionClient,
+      ffmpegChunks: {
+        resolveFfmpegPath,
+        splitAudioIntoChunks
+      }
+    });
+
+    const response = await request(app)
+      .post("/api/transcriptions")
+      .field("sourceType", "upload")
+      .field("modelId", "small")
+      .attach("audio", Buffer.from("audio"), "meeting.mp3")
+      .expect(501);
+
+    expect(response.body).toEqual({
+      code: "UPLOAD_FFMPEG_FALLBACK_DISABLED",
+      message: "Server-side upload chunking is disabled. Use browser upload chunking or set MEETINGCPU_ENABLE_FFMPEG_UPLOAD_FALLBACK=true."
+    });
+    expect(resolveFfmpegPath).not.toHaveBeenCalled();
+    expect(splitAudioIntoChunks).not.toHaveBeenCalled();
     expect(transcriptionClient.transcribe).not.toHaveBeenCalled();
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
     await expect(access(join(dataRoot, "sessions"))).rejects.toThrow();
@@ -807,6 +924,7 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -823,8 +941,8 @@ describe("server routes", () => {
 
     expect(splitAudioIntoChunks).toHaveBeenCalled();
     expect(transcribe).toHaveBeenCalledTimes(2);
-    expect(transcribe).toHaveBeenNthCalledWith(1, expect.objectContaining({ diarization: true }));
-    expect(transcribe).toHaveBeenNthCalledWith(2, expect.objectContaining({ diarization: true }));
+    expect(transcribe).toHaveBeenNthCalledWith(1, expect.objectContaining({ diarization: false }));
+    expect(transcribe).toHaveBeenNthCalledWith(2, expect.objectContaining({ diarization: false }));
     expect(response.body.sessionId).toContain("upload");
     expect(response.body.sessionPath).toBe(join(dataRoot, "sessions", response.body.sessionId));
     expect(response.body.recordingPath).toBe(join(response.body.sessionPath, "upload.webm"));
@@ -875,6 +993,7 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -930,6 +1049,7 @@ describe("server routes", () => {
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
       saveChunkFile,
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -967,6 +1087,7 @@ describe("server routes", () => {
       saveChunkFile: vi.fn(async () => {
         throw new Error("chunk disk full");
       }),
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1032,6 +1153,7 @@ describe("server routes", () => {
         }))
       },
       saveChunkFile,
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1089,6 +1211,7 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1129,6 +1252,7 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: { health: vi.fn(), transcribe },
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1182,6 +1306,7 @@ describe("server routes", () => {
       readUploadTranscriptJson: vi.fn(async () => {
         throw new Error("transcript json unavailable");
       }),
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1225,6 +1350,7 @@ describe("server routes", () => {
       dataRoot,
       transcriptionClient: fakeTranscriptionClient(),
       chunkSessionStore,
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks
@@ -1267,6 +1393,7 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: fakeTranscriptionClient(),
+      enableFfmpegUploadFallback: true,
       ffmpegChunks: {
         resolveFfmpegPath: vi.fn().mockResolvedValue("C:\\bin\\ffmpeg.exe"),
         splitAudioIntoChunks

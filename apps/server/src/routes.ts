@@ -79,6 +79,7 @@ export interface RouteDependencies {
   saveChunkFile?: typeof saveChunkFile;
   cleanupUploadedFile?: typeof cleanupUploadedFile;
   readUploadTranscriptJson?: typeof readUploadTranscriptJson;
+  enableFfmpegUploadFallback?: boolean;
   ffmpegChunks?: {
     resolveFfmpegPath?: typeof resolveFfmpegPath;
     splitAudioIntoChunks?: typeof splitAudioIntoChunks;
@@ -89,6 +90,10 @@ const MAX_AUDIO_UPLOAD_BYTES = 500 * 1024 * 1024;
 const UPLOAD_CHUNKING_UNAVAILABLE = {
   code: "UPLOAD_CHUNKING_UNAVAILABLE",
   message: "Upload chunking requires ffmpeg. Install ffmpeg or set FFMPEG_PATH."
+};
+const UPLOAD_FFMPEG_FALLBACK_DISABLED = {
+  code: "UPLOAD_FFMPEG_FALLBACK_DISABLED",
+  message: "Server-side upload chunking is disabled. Use browser upload chunking or set MEETINGCPU_ENABLE_FFMPEG_UPLOAD_FALLBACK=true."
 };
 const UPLOAD_CHUNKING_FAILED = {
   code: "UPLOAD_CHUNKING_FAILED",
@@ -195,16 +200,18 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       return;
     }
 
+    const sourceType = parseSourceType(request.body.sourceType);
     const session = await createChunkSession({
       dataRoot: dependencies.dataRoot,
       title: String(request.body.title ?? "local meeting"),
-      modelId: modelResult.value
+      modelId: modelResult.value,
+      sourceType
     });
     const state: RouteChunkSessionState = {
       session,
       modelId: modelResult.value,
       language: request.body.language ? String(request.body.language) : null,
-      diarization: parseBoolean(request.body.diarization, true),
+      diarization: parseBoolean(request.body.diarization, false),
       status: "recording",
       activeChunkUploads: 0,
       chunkUploadWaiters: [],
@@ -417,6 +424,12 @@ export function createRoutes(dependencies: RouteDependencies): Router {
 
     const sourceType = parseSourceType(request.body.sourceType);
     if (sourceType === "upload") {
+      if (!dependencies.enableFfmpegUploadFallback) {
+        await cleanupUpload(request.file);
+        response.status(501).json(UPLOAD_FFMPEG_FALLBACK_DISABLED);
+        return;
+      }
+
       await handleUploadTranscription({
         request,
         response,
@@ -424,7 +437,7 @@ export function createRoutes(dependencies: RouteDependencies): Router {
         modelId: modelResult.value,
         title: String(request.body.title ?? "local meeting"),
         language: request.body.language ? String(request.body.language) : null,
-        diarization: parseBoolean(request.body.diarization, true),
+        diarization: parseBoolean(request.body.diarization, false),
         cleanupUpload,
         resolveUploadFfmpegPath,
         splitUploadAudio,
@@ -455,7 +468,8 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       const transcript = await dependencies.transcriptionClient.transcribe({
         audioPath: saved.recordingPath,
         modelId: modelResult.value,
-        language: request.body.language ? String(request.body.language) : null
+        language: request.body.language ? String(request.body.language) : null,
+        diarization: parseBoolean(request.body.diarization, false)
       });
       await saveTranscript({ session, transcript, modelId: modelResult.value });
 
