@@ -149,6 +149,29 @@ def test_transcribe_endpoint_returns_transcript():
             "audio_path": "recording.webm",
             "model_id": "small",
             "language": None,
+            "diarization": False,
+        }
+    ]
+
+
+def test_transcribe_endpoint_forwards_enabled_diarization():
+    transcriber = FakeTranscriber()
+    client = TestClient(create_app(transcriber))
+    response = client.post(
+        "/transcribe",
+        json={
+            "audioPath": "recording.webm",
+            "modelId": "small",
+            "diarization": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert transcriber.calls == [
+        {
+            "audio_path": "recording.webm",
+            "model_id": "small",
+            "language": None,
             "diarization": True,
         }
     ]

@@ -14,7 +14,7 @@ class LocalTranscriber:
         self._models = {}
         self.diarizer = diarizer if diarizer is not None else self._create_diarizer()
 
-    def transcribe(self, audio_path, model_id, language, diarization=True):
+    def transcribe(self, audio_path, model_id, language, diarization=False):
         option = get_model_option(model_id)
         if option is None:
             raise ValueError(f"Unknown model: {model_id}")

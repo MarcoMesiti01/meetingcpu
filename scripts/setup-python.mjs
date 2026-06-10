@@ -13,6 +13,11 @@ const downloadDiarization = args[0] === "--download-diarization";
 const testPython = args[0] === "--test-python";
 const modelIds = downloadOnly ? args.slice(1) : ["small"];
 
+if (process.env.MEETINGCPU_SKIP_PYTHON_SETUP === "true" && args.length === 0) {
+  console.log("[setup] Skipping Python setup because MEETINGCPU_SKIP_PYTHON_SETUP=true.");
+  process.exit(0);
+}
+
 if (testPython) {
   const pytestTemp = join(process.cwd(), ".pytest_tmp", `${process.pid}-${Date.now()}`);
   mkdirSync(pytestTemp, { recursive: true });

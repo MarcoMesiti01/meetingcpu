@@ -34,6 +34,7 @@ export interface CreateSessionInput {
   title: string;
   modelId: string;
   language?: string;
+  sourceType?: "microphone" | "upload";
   diarization?: boolean;
 }
 

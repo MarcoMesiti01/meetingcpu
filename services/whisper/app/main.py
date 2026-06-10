@@ -11,7 +11,7 @@ class TranscribeRequest(BaseModel):
     audioPath: str
     modelId: str
     language: Optional[str] = None
-    diarization: bool = True
+    diarization: bool = False
 
 
 def create_default_transcriber():

@@ -11,8 +11,8 @@ The app records microphone audio in the browser, saves local session artifacts, 
 - Node.js 20 or newer
 - Python 3.9 or newer
 - Network access for the first install and model downloads
-- Optional: ffmpeg for uploaded audio transcription
-- Optional: Hugging Face token with accepted pyannote terms for speaker labels
+- Optional: ffmpeg only for the disabled-by-default server upload fallback
+- Optional: Hugging Face token with accepted pyannote terms for opt-in speaker labels
 
 ## Development Flow
 
@@ -27,11 +27,29 @@ In PowerShell environments where `npm.ps1` is blocked by execution policy, use `
 
 `npm run dev` starts the browser app, the local Node API, and the local Python transcription service.
 
+For restricted machines where install-time Python setup or model downloads are blocked, skip the postinstall step and run setup later from an approved network:
+
+```powershell
+$env:MEETINGCPU_SKIP_PYTHON_SETUP="true"
+npm.cmd install
+Remove-Item Env:\MEETINGCPU_SKIP_PYTHON_SETUP
+npm.cmd run download:model -- small
+```
+
+If the default ports are blocked, set local alternatives before starting the app:
+
+```powershell
+$env:MEETINGCPU_WEB_PORT="6173"
+$env:MEETINGCPU_SERVER_PORT="6174"
+$env:MEETINGCPU_WHISPER_PORT="6175"
+npm.cmd run dev
+```
+
 ## Live Chunking
 
 Microphone recordings are processed locally in 30-second chunks with a 5-second overlap. After each completed chunk is transcribed, the app saves `transcript.in-progress.txt` in the session folder so long meetings have a readable partial transcript while recording continues.
 
-When recording stops, the final transcript is assembled from the saved chunk results. The app does not retranscribe the full microphone recording at the end. Session chunk files are saved under `apps/server/data/sessions/<id>/chunks` by default. Set `MEETINGCPU_DATA_DIR` to use a different local data directory.
+When recording stops, the final transcript is assembled from the saved chunk results. The app does not retranscribe the full microphone recording at the end. On Windows, session chunk files are saved under `%LOCALAPPDATA%\meetingcpu\data\sessions\<id>\chunks` by default. Set `MEETINGCPU_DATA_DIR` to use a different local data directory.
 
 ## Models
 
@@ -53,7 +71,7 @@ The download step needs network access. After a model is present under `models/`
 
 ## Optional Speaker Labels
 
-Speaker diarization uses `pyannote.audio` and is optional. Before the first diarization download, accept the Hugging Face conditions for [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1). Store the access token in the ignored `.env` file:
+Speaker diarization uses `pyannote.audio` and is optional. It is disabled by default for reliability on restricted laptops; enable speaker labels in the UI only after the local diarization setup works. Before the first diarization download, accept the Hugging Face conditions for [`pyannote/speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1). Store the access token in the ignored `.env` file:
 
 ```powershell
 npm.cmd install
@@ -74,15 +92,18 @@ If diarization is unavailable, missing, or not downloaded, transcription still r
 
 ## Saved Sessions
 
-Live microphone sessions save chunk audio files, in-progress transcripts, and final transcript files under `apps/server/data/sessions/` by default. The continuous full recording is available in the browser when recording stops, but it is not saved under the server session folder. This directory is intentionally ignored by git. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
+Live microphone sessions save chunk audio files, in-progress transcripts, and final transcript files under `%LOCALAPPDATA%\meetingcpu\data\sessions\` on Windows by default. On non-Windows systems without an explicit data directory, the fallback is `data/sessions/` from the server working directory. The continuous full recording is available in the browser when recording stops, but it is not saved under the server session folder. Set `MEETINGCPU_DATA_DIR` before starting the server to use another local data directory.
 
-Uploaded audio is also chunked locally before transcription when `FFMPEG_PATH` is set or `ffmpeg` is available on `PATH`. If ffmpeg is unavailable, the app returns a controlled requirement error instead of silently falling back to a different path.
+Uploaded audio is chunked in the browser by default. The browser decodes the file, creates WAV chunks, and sends them through the same saved-session pipeline used by microphone recording. This path does not require `FFMPEG_PATH`, global `PATH` changes, or a server-side ffmpeg install.
 
-On Windows, install ffmpeg and make sure `ffmpeg.exe` is available on `PATH`, or set `FFMPEG_PATH` to the full executable path:
+The legacy server-side upload splitter is disabled by default. Enable it only if browser decoding is not enough and ffmpeg is approved on the machine:
 
 ```powershell
+$env:MEETINGCPU_ENABLE_FFMPEG_UPLOAD_FALLBACK="true"
 $env:FFMPEG_PATH="C:\Program Files\ffmpeg\bin\ffmpeg.exe"
 ```
+
+If the browser cannot decode an uploaded file, convert it to WAV, MP3, M4A, or WebM on an approved machine, or enable the fallback above after making ffmpeg available.
 
 ## Verification
 
@@ -103,6 +124,6 @@ npm run dev
 
 The PowerShell equivalent is `npm.cmd run dev`.
 
-Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under `apps/server/data/sessions/` with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
+Open the printed Vite URL, record a short microphone clip, stop recording, and confirm that a session folder appears under the configured data directory with `chunks/`, `transcript.in-progress.txt`, and the final transcript files.
 
 If these commands fail because local dependencies are missing, run `npm install` first. Installation needs network access for JavaScript dependencies, Python dependencies, and the model download; after dependencies and models are present, recording and transcription are intended to run locally/offline.
