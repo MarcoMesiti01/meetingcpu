@@ -321,6 +321,76 @@ describe("chunk session storage", () => {
     ]);
   });
 
+  it("retries transient Windows EPERM errors while replacing chunk result JSON during finalize", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    let failNextChunkResultRename = false;
+    let renameFailedOnce = false;
+    vi.resetModules();
+    vi.doMock("node:fs/promises", async () => {
+      const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+      return {
+        ...actual,
+        rename: async (...args: Parameters<typeof actual.rename>) => {
+          const destinationPath = args[1].toString();
+          if (
+            failNextChunkResultRename &&
+            !renameFailedOnce &&
+            destinationPath.endsWith(join("chunk-results", "chunk-000042.json"))
+          ) {
+            renameFailedOnce = true;
+            const error = new Error("file is temporarily locked") as Error & { code: string };
+            error.code = "EPERM";
+            throw error;
+          }
+          return await actual.rename(...args);
+        }
+      };
+    });
+
+    try {
+      const {
+        createChunkSession: createRetrySession,
+        finalizeChunkSession: finalizeRetrySession,
+        saveChunkFile: saveRetryChunkFile,
+        saveChunkResult: saveRetryChunkResult
+      } = await import("./chunkSessions.js");
+      const session = await createRetrySession({ dataRoot: root, modelId: "small" });
+      const sourcePath = join(root, "chunk-42.webm");
+      await writeFile(sourcePath, "audio-42");
+      await saveRetryChunkFile({
+        session,
+        sourcePath,
+        index: 42,
+        startSeconds: 0,
+        endSeconds: 1,
+        overlapSeconds: 0,
+        mimeType: "audio/webm"
+      });
+      await saveRetryChunkResult({
+        session,
+        result: {
+          chunkIndex: 42,
+          text: "Transient lock.",
+          language: "en",
+          durationSeconds: 1,
+          diarization: { available: false, enabled: false },
+          segments: [{ start: 0, end: 1, text: "Transient lock." }]
+        }
+      });
+
+      failNextChunkResultRename = true;
+      await expect(finalizeRetrySession({ session })).resolves.toMatchObject({ partial: false });
+
+      expect(renameFailedOnce).toBe(true);
+      await expect(readFile(join(session.chunkResultsPath, "chunk-000042.json"), "utf8")).resolves.toContain(
+        "Transient lock."
+      );
+    } finally {
+      vi.doUnmock("node:fs/promises");
+      vi.resetModules();
+    }
+  });
+
   it("normalizes chunk-relative timestamps before saving accepted segments", async () => {
     const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
     const session = await createChunkSession({ dataRoot: root, modelId: "small" });

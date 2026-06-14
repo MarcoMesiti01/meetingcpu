@@ -63,6 +63,7 @@ type ChunkStoredTranscriptResult = ChunkTranscriptResult & {
 };
 
 const sessionMutationChains = new Map<string, Promise<void>>();
+const TRANSIENT_FILE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800, 1000];
 
 export async function createChunkSession(input: {
   dataRoot: string;
@@ -156,9 +157,9 @@ export async function saveChunkResult(input: {
     const resultAcceptedSegments =
       acceptedResults.find((result) => result.chunkIndex === input.result.chunkIndex)?.acceptedSegments ?? [];
 
-    await Promise.all(
-      acceptedResults.map((result) => writeJsonAtomic(resultPath(input.session, result.chunkIndex), result))
-    );
+    for (const result of acceptedResults) {
+      await writeJsonAtomic(resultPath(input.session, result.chunkIndex), result);
+    }
     await writeManifest(input.session, setManifestStatus(manifest, input.result.chunkIndex, "transcribed"));
     const formattedTranscriptText = transcriptText(acceptedTranscriptSegments, true);
     await writeFile(input.session.inProgressTranscriptPath, formattedTranscriptText);
@@ -207,9 +208,9 @@ export async function finalizeChunkSession(input: {
 }): Promise<{ transcriptPath: string; transcriptJsonPath: string; partial: boolean }> {
   return withSessionMutation(input.session, async () => {
     const results = applyAcceptedSegments(await readChunkResults(input.session));
-    await Promise.all(
-      results.map((result) => writeJsonAtomic(resultPath(input.session, result.chunkIndex), result))
-    );
+    for (const result of results) {
+      await writeJsonAtomic(resultPath(input.session, result.chunkIndex), result);
+    }
     const segments = acceptedSegments(results);
     const text = transcriptText(segments, false);
     const language = results.find((result) => result.language)?.language ?? "";
@@ -454,11 +455,33 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   const temporaryPath = join(dirname(path), `.${randomUUID()}.tmp`);
   try {
     await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`);
-    await rename(temporaryPath, path);
+    await renameWithTransientRetry(temporaryPath, path);
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
+}
+
+async function renameWithTransientRetry(sourcePath: string, destinationPath: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(sourcePath, destinationPath);
+      return;
+    } catch (error) {
+      if (!isTransientFileAccessError(error) || attempt >= TRANSIENT_FILE_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+      await delay(TRANSIENT_FILE_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+function isTransientFileAccessError(error: unknown): boolean {
+  return isNodeError(error) && (error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY");
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function withSessionMutation<T>(session: ChunkSession, operation: () => Promise<T>): Promise<T> {
