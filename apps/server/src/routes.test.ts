@@ -6,7 +6,7 @@ import { join } from "node:path";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createApp } from "./app.js";
-import { saveChunkFile as realSaveChunkFile } from "./chunkSessions.js";
+import { saveChunkFile as realSaveChunkFile, saveChunkResult } from "./chunkSessions.js";
 import type { RouteChunkSessionState } from "./routes.js";
 import { SessionEventHub } from "./sessionEvents.js";
 
@@ -320,6 +320,7 @@ describe("server routes", () => {
 
   it("rejects late chunks while a session is finalizing", async () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const chunkSessionStore = new Map<string, RouteChunkSessionState>();
     let resolveWait!: () => void;
     const chunkQueue = {
       enqueue: vi.fn().mockResolvedValue(undefined),
@@ -333,9 +334,24 @@ describe("server routes", () => {
     const app = createApp({
       dataRoot,
       transcriptionClient: fakeTranscriptionClient(),
-      chunkQueue
+      chunkQueue,
+      chunkSessionStore
     });
     const created = await request(app).post("/api/sessions").send({ title: "Finalizing", modelId: "small" }).expect(201);
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
+    const session = chunkSessionStore.get(created.body.sessionId)?.session;
+    expect(session).toBeDefined();
+    await saveChunkResult({
+      session: session!,
+      result: {
+        chunkIndex: 1,
+        text: "Ready to finalize.",
+        language: "en",
+        durationSeconds: 2,
+        segments: [{ start: 0, end: 2, text: "Ready to finalize." }],
+        diarization: { available: false, enabled: false }
+      }
+    });
 
     const finalizeResponse = request(app)
       .post(`/api/sessions/${created.body.sessionId}/finalize`)
@@ -356,7 +372,7 @@ describe("server routes", () => {
       code: "SESSION_FINALIZING",
       message: "Session is finalizing and no longer accepts chunks."
     });
-    expect(chunkQueue.enqueue).not.toHaveBeenCalled();
+    expect(chunkQueue.enqueue).toHaveBeenCalledTimes(1);
     await expect(readdir(join(dataRoot, "uploads", "tmp"))).resolves.toEqual([]);
 
     resolveWait();
@@ -367,14 +383,22 @@ describe("server routes", () => {
     const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
     const events = new SessionEventHub();
     const published: string[] = [];
+    const transcribe = vi.fn().mockResolvedValue({
+      text: "Closed transcript.",
+      language: "en",
+      durationSeconds: 2,
+      segments: [{ start: 0, end: 2, text: "Closed transcript." }],
+      diarization: { available: false, enabled: false }
+    });
     const app = createApp({
       dataRoot,
-      transcriptionClient: fakeTranscriptionClient(),
+      transcriptionClient: { health: vi.fn(), transcribe },
       events
     });
     const created = await request(app).post("/api/sessions").send({ title: "Closed", modelId: "small" }).expect(201);
     events.subscribe(created.body.sessionId, (event) => published.push(event.type));
 
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
     await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(200);
 
     const lateChunk = await request(app)
@@ -646,7 +670,19 @@ describe("server routes", () => {
       saveStarted = resolve;
     });
     const chunkQueue = {
-      enqueue: vi.fn().mockResolvedValue(undefined),
+      enqueue: vi.fn(async (input) => {
+        await saveChunkResult({
+          session: input.session,
+          result: {
+            chunkIndex: input.chunkIndex,
+            text: "Queued transcript.",
+            language: "en",
+            durationSeconds: 2,
+            segments: [{ start: 0, end: 2, text: "Queued transcript." }],
+            diarization: { available: false, enabled: false }
+          }
+        });
+      }),
       waitForSession: vi.fn().mockResolvedValue(undefined)
     };
     const app = createApp({
@@ -654,20 +690,12 @@ describe("server routes", () => {
       transcriptionClient: fakeTranscriptionClient(),
       chunkQueue,
       chunkSessionStore,
-      saveChunkFile: vi.fn(async ({ session, sourcePath, index, startSeconds, endSeconds }) => {
+      saveChunkFile: vi.fn(async (input) => {
         saveStarted();
         await new Promise<void>((resolve) => {
           releaseSave = resolve;
         });
-        const chunkPath = join(session.path, "chunks", "chunk-000001.webm");
-        await writeFile(chunkPath, await readFile(sourcePath));
-        return {
-          index,
-          path: chunkPath,
-          startSeconds,
-          endSeconds,
-          overlapSeconds: 0
-        };
+        return realSaveChunkFile(input);
       })
     });
     const created = await request(app).post("/api/sessions").send({ title: "Lifecycle", modelId: "small" }).expect(201);
@@ -752,6 +780,28 @@ describe("server routes", () => {
       partial: true,
       failedChunks: [{ chunkIndex: 2, code: "MODEL_UNAVAILABLE", message: "Model is unavailable." }]
     });
+  });
+
+  it("returns a controlled error instead of finalizing an empty transcript when every chunk fails", async () => {
+    const dataRoot = await mkdtemp(join(tmpdir(), "meetingcpu-"));
+    const transcribe = vi.fn().mockRejectedValue({ code: "MODEL_UNAVAILABLE", status: 503, message: "Model is unavailable." });
+    const app = createApp({
+      dataRoot,
+      transcriptionClient: { health: vi.fn(), transcribe }
+    });
+    const created = await request(app).post("/api/sessions").send({ title: "All failed", modelId: "small" }).expect(201);
+
+    await uploadChunk(app, created.body.sessionId, 1, "chunk-audio").expect(202);
+
+    const finalized = await request(app).post(`/api/sessions/${created.body.sessionId}/finalize`).expect(500);
+
+    expect(finalized.body).toEqual({
+      code: "NO_TRANSCRIBED_CHUNKS",
+      message: "No chunks were transcribed successfully. Check chunk failures in the session metadata."
+    });
+    const sessionPath = join(dataRoot, "sessions", created.body.sessionId);
+    await expect(readFile(join(sessionPath, "transcript.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(sessionPath, "transcript.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects unknown model ids before saving work", async () => {

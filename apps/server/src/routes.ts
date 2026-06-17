@@ -7,6 +7,7 @@ import { ChunkQueue, type ChunkQueueInput } from "./chunkQueue.js";
 import {
   createChunkSession,
   finalizeChunkSession,
+  isChunkSessionFinalizationError,
   markChunkFailed,
   saveChunkFile,
   saveChunkResult,
@@ -390,6 +391,10 @@ export function createRoutes(dependencies: RouteDependencies): Router {
       finalized = await finalizeChunkSession({ session: state.session });
     } catch (error) {
       state.status = "recording";
+      if (isChunkSessionFinalizationError(error)) {
+        response.status(error.status).json({ code: error.code, message: error.message });
+        return;
+      }
       throw error;
     }
     state.status = "finalized";

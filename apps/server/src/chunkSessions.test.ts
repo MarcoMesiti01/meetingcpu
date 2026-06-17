@@ -669,4 +669,63 @@ describe("chunk session storage", () => {
       lastCommittedEndSeconds: 5
     });
   });
+
+  it("does not finalize an empty transcript when every uploaded chunk failed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 30 });
+    await markChunkFailed({
+      session,
+      chunkIndex: 1,
+      code: "CHUNK_PROCESSING_FAILED",
+      message: "Chunk transcript could not be saved."
+    });
+
+    await expect(finalizeChunkSession({ session })).rejects.toMatchObject({
+      code: "NO_TRANSCRIBED_CHUNKS"
+    });
+    await expect(readFile(join(session.path, "transcript.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(session.path, "transcript.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not finalize an empty transcript when no chunks were uploaded", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+
+    await expect(finalizeChunkSession({ session })).rejects.toMatchObject({
+      code: "NO_TRANSCRIBED_CHUNKS"
+    });
+    await expect(readFile(join(session.path, "transcript.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(session.path, "transcript.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("ignores stale result files for chunks that were not committed as transcribed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "meetingcpu-chunks-"));
+    const session = await createChunkSession({ dataRoot: root, modelId: "small" });
+    await saveManifestedChunk({ root, session, index: 1, startSeconds: 0, endSeconds: 30 });
+    await writeFile(
+      join(session.chunkResultsPath, "chunk-000001.json"),
+      JSON.stringify({
+        chunkIndex: 1,
+        text: "Stale result.",
+        language: "en",
+        durationSeconds: 1,
+        segments: [{ start: 0, end: 1, text: "Stale result." }],
+        acceptedSegments: [{ start: 0, end: 1, text: "Stale result." }],
+        diarization: { available: false, enabled: false }
+      })
+    );
+    await markChunkFailed({
+      session,
+      chunkIndex: 1,
+      code: "CHUNK_PROCESSING_FAILED",
+      message: "Result was not committed."
+    });
+
+    await expect(finalizeChunkSession({ session })).rejects.toMatchObject({
+      code: "NO_TRANSCRIBED_CHUNKS"
+    });
+    await expect(readFile(join(session.path, "transcript.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(join(session.path, "transcript.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });

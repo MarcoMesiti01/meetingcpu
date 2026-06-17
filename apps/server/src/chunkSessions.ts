@@ -52,6 +52,11 @@ export interface ChunkAcceptedTranscriptUpdate {
   transcriptText: string;
 }
 
+export interface ChunkSessionFinalizationError extends Error {
+  code: "NO_TRANSCRIBED_CHUNKS";
+  status: 500;
+}
+
 interface ChunkFailure {
   chunkIndex: number;
   code: string;
@@ -149,8 +154,9 @@ export async function saveChunkResult(input: {
       segments: normalizeSegments(input.result.segments, manifestEntry),
       acceptedSegments: []
     };
+    const transcribedChunkIndexes = transcribedManifestIndexes(manifest);
     const existingResults = (await readChunkResults(input.session)).filter(
-      (result) => result.chunkIndex !== input.result.chunkIndex
+      (result) => result.chunkIndex !== input.result.chunkIndex && transcribedChunkIndexes.has(result.chunkIndex)
     );
     const acceptedResults = applyAcceptedSegments([...existingResults, storedResult]);
     const acceptedTranscriptSegments = acceptedSegments(acceptedResults);
@@ -207,15 +213,26 @@ export async function finalizeChunkSession(input: {
   session: ChunkSession;
 }): Promise<{ transcriptPath: string; transcriptJsonPath: string; partial: boolean }> {
   return withSessionMutation(input.session, async () => {
-    const results = applyAcceptedSegments(await readChunkResults(input.session));
+    const manifest = await readManifest(input.session);
+    const transcribedChunkIndexes = transcribedManifestIndexes(manifest);
+    const committedResults = (await readChunkResults(input.session)).filter((result) =>
+      transcribedChunkIndexes.has(result.chunkIndex)
+    );
+    const results = applyAcceptedSegments(committedResults);
     for (const result of results) {
       await writeJsonAtomic(resultPath(input.session, result.chunkIndex), result);
     }
+    const metadata = await readMetadata(input.session);
+    if (results.length === 0) {
+      throw createChunkSessionFinalizationError(
+        "NO_TRANSCRIBED_CHUNKS",
+        "No chunks were transcribed successfully. Check chunk failures in the session metadata."
+      );
+    }
+
     const segments = acceptedSegments(results);
     const text = transcriptText(segments, false);
     const language = results.find((result) => result.language)?.language ?? "";
-    const metadata = await readMetadata(input.session);
-    const manifest = await readManifest(input.session);
     const durationSeconds = Math.max(maxSegmentEnd(segments), maxManifestEnd(manifest));
     const partial = readFailures(metadata).length > 0 || manifest.some((entry) => entry.status === "failed");
     const transcript = {
@@ -240,6 +257,30 @@ export async function finalizeChunkSession(input: {
     });
     return { transcriptPath, transcriptJsonPath, partial };
   });
+}
+
+export function isChunkSessionFinalizationError(error: unknown): error is ChunkSessionFinalizationError {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "NO_TRANSCRIBED_CHUNKS" &&
+    "status" in error &&
+    error.status === 500
+  );
+}
+
+function createChunkSessionFinalizationError(
+  code: ChunkSessionFinalizationError["code"],
+  message: string
+): ChunkSessionFinalizationError {
+  const error = new Error(message) as ChunkSessionFinalizationError;
+  error.code = code;
+  error.status = 500;
+  return error;
+}
+
+function transcribedManifestIndexes(manifest: ChunkManifestEntry[]): Set<number> {
+  return new Set(manifest.filter((entry) => entry.status === "transcribed").map((entry) => entry.index));
 }
 
 function withChunkPaths(session: Session): ChunkSession {
